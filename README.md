@@ -24,13 +24,37 @@ and the app opens in a new browser tab at `https://<codespace-name>-5173.app.git
 
 ```
 py -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements-browser.txt
 .venv\Scripts\python -m playwright install chromium
 .venv\Scripts\python app.py
 ```
 
 Then open http://localhost:5173 (or `http://localhost:5173/#/?url=stripe.com` to analyze straight away).
-Set the `PORT` environment variable to use a different port.
+Set the `PORT` environment variable to use a different port. `requirements.txt` alone installs everything except the
+headless browser; the app then runs the quick analysis only.
+
+## Deploy to Vercel
+
+Vercel runs the app as a serverless Python function (`api/index.py`, configured in `vercel.json`), which changes
+what it can do:
+
+| Works | Doesn't work on Vercel |
+|---|---|
+| Quick analysis (technology, design from CSS, SEO, security, HTML accessibility checks, resource sizes) | The browser pass: screenshots, Core Web Vitals, axe-core, computed styles. Playwright's Chromium is too large for a Vercel function, so only `requirements.txt` is installed |
+| All twelve OSINT tools, Compare, History, Projects, manual uptime entries, "Check now" | Uptime monitoring and scheduled watching, which need a process that keeps running |
+| Alerts raised by analyses and OSINT lookups, sent while the request runs | Keeping data: the database lives in `/tmp` and is lost whenever Vercel recycles the function, and each instance has its own copy |
+
+To deploy:
+
+1. On [vercel.com/new](https://vercel.com/new), import the `deconstruct-site` repository (allow Vercel's GitHub app
+   to access it). Keep the defaults; `vercel.json` sets the build.
+2. Under **Environment Variables**, add `APP_PASSWORD`. Without it anyone with the URL can use the app and see its data.
+   The browser asks for it (any username). Optionally add `CRUX_API_KEY` for real-user vitals and `APP_URL` for
+   notification links.
+3. Deploy. Every push to `main` redeploys; other branches get preview URLs.
+
+For the full app (browser pass, monitoring, data that persists) use a host that runs a long-lived server with a disk,
+such as Fly.io, Railway or a small VPS.
 
 ## The sidebar
 
@@ -66,7 +90,9 @@ SMTP_HOST=smtp.example.com SMTP_PORT=587 SMTP_USER=me@example.com SMTP_PASSWORD=
 ```
 
 Set `APP_URL` to the address the app is reachable at so links in notifications work (default `http://localhost:$PORT`,
-or the forwarded URL in a codespace).
+or the forwarded URL in a codespace). Webhooks must point to public internet addresses and aren't sent on through
+redirects; set `ALLOW_PRIVATE_WEBHOOKS=1` to send alerts to a tool on your own network (n8n, Home Assistant) when
+the app isn't reachable by others.
 
 ### OSINT tools
 
@@ -133,6 +159,8 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 ## Files
 
 - `app.py` — Flask server and API routes
+- `api/index.py`, `vercel.json`, `.vercelignore` — Vercel deployment (see above)
+- `.devcontainer/` — GitHub Codespaces setup
 - `analyzer.py` — fetching, every report section, scoring, and merging in browser results
 - `browser.py` — headless Chromium pass (vitals, screenshots, computed styles, contrast, JS globals)
 - `signatures.py` — HTML/header technology fingerprints; add a line to detect something new

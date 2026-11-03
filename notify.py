@@ -3,7 +3,8 @@
 Delivery runs on a background thread so detection never waits on a slow
 endpoint. Email uses SMTP settings from environment variables (SMTP_HOST,
 SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM) so no password is stored in
-the database. APP_URL sets the base of links in messages.
+the database. APP_URL sets the base of links in messages. Webhooks must point to
+public addresses unless ALLOW_PRIVATE_WEBHOOKS is set.
 """
 from __future__ import annotations
 
@@ -13,10 +14,12 @@ import re
 import smtplib
 import threading
 from email.message import EmailMessage
+from urllib.parse import urlparse
 
 import requests
 
 import store
+from analyzer import _host_is_public
 
 log = logging.getLogger("notify")
 
@@ -47,6 +50,9 @@ def validate(kind: str, target: str) -> str | None:
             return "Slack needs an Incoming Webhook URL (https://hooks.slack.com/services/…)."
         if kind == "discord" and not re.search(r"discord(app)?\.com/api/webhooks/", target):
             return "Discord needs a channel webhook URL (https://discord.com/api/webhooks/…)."
+        # ALLOW_PRIVATE_WEBHOOKS=1 permits local tools (n8n, Home Assistant) on a machine only you can reach
+        if not os.environ.get("ALLOW_PRIVATE_WEBHOOKS") and not _host_is_public(urlparse(target).hostname or ""):
+            return "Webhooks must point to a public internet address, not a private or local one."
     elif kind == "email":
         addrs = [a.strip() for a in target.split(",") if a.strip()]
         if not addrs or not all(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", a) for a in addrs):
@@ -80,17 +86,17 @@ def _send(channel: dict, event: dict, timeout=10):
     if kind == "webhook":
         payload = {"app": "Deconstruct Site", "url": url, "event": {k: event.get(k) for k in
                    ("id", "created_at", "kind", "severity", "title", "target", "site_id", "detail")}}
-        r = _session.post(target, json=payload, timeout=timeout)
+        r = _session.post(target, json=payload, timeout=timeout, allow_redirects=False)
     elif kind == "slack":
         text = f"{ICON[event['severity']]} *{event['title']}*" + "".join(f"\n• {l}" for l in lines[:8]) + f"\n<{url}|Open in Deconstruct Site>"
-        r = _session.post(target, json={"text": text}, timeout=timeout)
+        r = _session.post(target, json={"text": text}, timeout=timeout, allow_redirects=False)
     elif kind == "discord":
         embed = {"title": event["title"][:256], "description": "\n".join(f"• {l}" for l in lines[:10])[:3500] or None,
                  "color": COLOR[event["severity"]], "timestamp": event["created_at"].replace("Z", "+00:00"),
                  "footer": {"text": f"Deconstruct Site · {event['severity']}"}}
         if url.startswith("https://"):
             embed["url"] = url
-        r = _session.post(target, json={"embeds": [embed]}, timeout=timeout)
+        r = _session.post(target, json={"embeds": [embed]}, timeout=timeout, allow_redirects=False)
     elif kind == "email":
         host = os.environ.get("SMTP_HOST")
         if not host:
@@ -111,6 +117,9 @@ def _send(channel: dict, event: dict, timeout=10):
         return
     else:
         raise RuntimeError(f"Unknown channel type {kind}")
+    if 300 <= r.status_code < 400:
+        # Not followed: a redirect could send the alert on to a private address
+        raise RuntimeError(f"HTTP {r.status_code}: the webhook redirected to {r.headers.get('location', 'another URL')}")
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
 
@@ -149,7 +158,12 @@ def _deliver(events: list[dict]):
 
 
 def dispatch(events: list[dict]):
-    if events:
+    if not events:
+        return
+    if os.environ.get("VERCEL"):
+        # A serverless function is frozen once it responds, so a background thread might never finish
+        _deliver(events)
+    else:
         threading.Thread(target=_deliver, args=(events,), name="notify", daemon=True).start()
 
 

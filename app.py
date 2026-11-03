@@ -4,11 +4,13 @@ Also keeps a library of analyzed sites: projects that group them, every
 analysis saved as an iteration, an uptime log per site, and change alerts
 raised when a newer result differs from the previous one.
 """
+import hmac
 import os
 from datetime import datetime, timezone
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
+import browser
 import monitor
 import notify
 import osint
@@ -18,6 +20,20 @@ from analyzer import AnalysisError, analyze
 from compare import compare
 
 app = Flask(__name__, static_folder="static")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+# Vercel runs each request in a short-lived function: no background threads, no Chromium
+SERVERLESS = bool(os.environ.get("VERCEL"))
+
+
+@app.before_request
+def require_password():
+    """With APP_PASSWORD set, every page and API call needs it (any username) via HTTP Basic auth."""
+    if not APP_PASSWORD:
+        return None
+    auth = request.authorization
+    if auth and hmac.compare_digest((auth.password or "").encode(), APP_PASSWORD.encode()):
+        return None
+    return Response("Password required.", 401, {"WWW-Authenticate": 'Basic realm="Deconstruct Site"'})
 
 
 def ok(data=None, status=200):
@@ -63,7 +79,7 @@ def api_analyze():
     except (TypeError, ValueError):
         return fail("perf_runs must be a number from 1 to 5.")
     try:
-        report = analyze(url, render=b.get("render", True) is not False, perf_runs=runs)
+        report = analyze(url, render=browser.AVAILABLE and b.get("render", True) is not False, perf_runs=runs)
     except AnalysisError as e:
         return fail(str(e), 422)
     saved = watch.save_analysis(url, report, label=str(b.get("label", "")), project_id=b.get("project_id"))
@@ -383,7 +399,7 @@ def api_watch():
 
 @app.get("/api/health")
 def health():
-    return ok()
+    return ok({"browser": browser.AVAILABLE, "background": not SERVERLESS})
 
 
 store.init()

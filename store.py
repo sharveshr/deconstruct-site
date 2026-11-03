@@ -16,7 +16,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-DB_PATH = os.environ.get("DECONSTRUCT_DB", os.path.join(os.path.dirname(__file__), "data", "deconstruct.db"))
+# Vercel functions can only write to /tmp, which is wiped whenever an instance is recycled
+_DEFAULT_DB = ("/tmp/deconstruct.db" if os.environ.get("VERCEL")
+               else os.path.join(os.path.dirname(__file__), "data", "deconstruct.db"))
+DB_PATH = os.environ.get("DECONSTRUCT_DB", _DEFAULT_DB)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (

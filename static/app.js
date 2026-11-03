@@ -114,8 +114,12 @@ const fresh = token => token === navToken;
 
 // ---------------------------------------------------------------- analyze
 
+// What this deployment can do; on Vercel there is no headless browser and no background scheduler
+let caps = null;
+const getCaps = async () => caps ??= await api("/api/health").catch(() => ({ browser: true, background: true }));
+
 async function pageAnalyze(q, token) {
-  const projects = await api("/api/projects").catch(() => []);
+  const [projects, cap] = await Promise.all([api("/api/projects").catch(() => []), getCaps()]);
   if (!fresh(token)) return;
   const preProject = q.get("project");
   view.innerHTML = `<div class="wrap">
@@ -131,13 +135,17 @@ async function pageAnalyze(q, token) {
         ${["stripe.com", "github.com", "wordpress.org", "vercel.com"].map(u => `<button class="chip" type="button" data-url="${u}">${u}</button>`).join("")}
       </div>
       <div class="row" style="margin-top:12px;gap:18px">
-        <label class="toggle" style="margin:0"><input type="checkbox" id="render" checked> Load in a real browser (screenshots, Core Web Vitals, axe-core)</label>
+        ${cap.browser ? `<label class="toggle" style="margin:0"><input type="checkbox" id="render" checked> Load in a real browser (screenshots, Core Web Vitals, axe-core)</label>
         <label class="toggle" style="margin:0" title="Throttled mobile loads; the report shows the median">Mobile runs
-          <select class="field" id="runs" style="padding:4px 8px;font-size:13px"><option value="1">1 · fastest</option><option value="3" selected>3 · median</option><option value="5">5 · most stable</option></select></label>
+          <select class="field" id="runs" style="padding:4px 8px;font-size:13px"><option value="1">1 · fastest</option><option value="3" selected>3 · median</option><option value="5">5 · most stable</option></select></label>` : ""}
         ${projects.length ? `<label class="toggle" style="margin:0">Save to project
           <select class="field" id="proj" style="padding:4px 8px;font-size:13px"><option value="">None</option>
           ${projects.map(p => `<option value="${p.id}" ${String(p.id) === preProject ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>` : ""}
       </div>
+      ${!cap.browser || !cap.background ? `<p class="muted" style="margin-top:12px;font-size:13px">${[
+        !cap.browser && "This deployment runs the quick analysis only: no screenshots, Core Web Vitals or axe-core, which need a headless browser.",
+        !cap.background && "Uptime monitoring and scheduled watching don't run here, and saved data may be cleared when the server restarts."
+      ].filter(Boolean).join(" ")}</p>` : ""}
     </section>
     <div class="status" id="status"><div class="spinner"></div><span id="status-text">Analyzing…</span></div>
     <div class="error" id="error" role="alert"></div>
@@ -160,7 +168,7 @@ function showRunning() {
 
 async function runAnalysis(url) {
   url = url.trim(); if (!url || running) return;
-  const useBrowser = $("#render")?.checked ?? true;
+  const useBrowser = $("#render")?.checked ?? (caps?.browser ?? true);
   const projectId = $("#proj")?.value || null;
   const perfRuns = +($("#runs")?.value || 3);
   running = { url, step: steps[0] };
