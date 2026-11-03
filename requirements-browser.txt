@@ -1,0 +1,5 @@
+# The headless-browser pass (screenshots, Core Web Vitals, axe-core). Playwright's Chromium is too
+# large for Vercel's functions, so a Vercel deploy installs requirements.txt only (the quick analysis).
+-r requirements.txt
+playwright>=1.48
+axe-playwright-python>=0.1.8

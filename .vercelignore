@@ -1,0 +1,5 @@
+.venv
+.devcontainer
+.claude
+__pycache__
+data
