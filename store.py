@@ -75,7 +75,42 @@ CREATE TABLE IF NOT EXISTS osint_results (
   result BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS osint_target ON osint_results(target, tool, ran_at);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+  target TEXT,
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+  title TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '{}',
+  dedup_key TEXT,
+  read INTEGER NOT NULL DEFAULT 0,
+  notified TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS events_created ON events(created_at);
+CREATE INDEX IF NOT EXISTS events_dedup ON events(dedup_key);
+CREATE TABLE IF NOT EXISTS channels (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('webhook', 'slack', 'discord', 'email')),
+  name TEXT NOT NULL,
+  target TEXT NOT NULL,
+  min_severity TEXT NOT NULL DEFAULT 'warning' CHECK (min_severity IN ('info', 'warning', 'critical')),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  last_sent_at TEXT,
+  last_error TEXT
+);
 """
+
+# Columns added after the first release; init() adds any that an older database is missing.
+SITE_COLUMNS = {
+    "watch_analyze_hours": "INTEGER NOT NULL DEFAULT 0",
+    "watch_osint_hours": "INTEGER NOT NULL DEFAULT 0",
+    "last_watch_analysis_at": "TEXT",
+    "last_watch_osint_at": "TEXT",
+}
+SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
 
 def now_iso() -> str:
@@ -103,6 +138,10 @@ def init():
     with db() as c:
         c.execute("PRAGMA journal_mode = WAL")
         c.executescript(SCHEMA)
+        have = {r["name"] for r in c.execute("PRAGMA table_info(sites)")}
+        for col, decl in SITE_COLUMNS.items():
+            if col not in have:
+                c.execute(f"ALTER TABLE sites ADD COLUMN {col} {decl}")
 
 
 def site_key(url: str) -> str:
@@ -148,8 +187,18 @@ def list_sites() -> list[dict]:
         return [_site_row(r) for r in rows]
 
 
-def update_site(site_id: int, *, monitor_enabled=None, monitor_interval_min=None, title=None):
+WATCH_HOURS = (0, 1, 6, 12, 24, 72, 168)
+
+
+def update_site(site_id: int, *, monitor_enabled=None, monitor_interval_min=None, title=None,
+                watch_analyze_hours=None, watch_osint_hours=None):
     sets, args = [], []
+    for col, val in (("watch_analyze_hours", watch_analyze_hours), ("watch_osint_hours", watch_osint_hours)):
+        if val is not None:
+            val = int(val)
+            if val not in WATCH_HOURS:
+                raise ValueError(f"{col} must be one of {WATCH_HOURS}")
+            sets.append(f"{col} = ?"); args.append(val)
     if monitor_enabled is not None:
         sets.append("monitor_enabled = ?"); args.append(1 if monitor_enabled else 0)
     if monitor_interval_min is not None:
@@ -409,10 +458,19 @@ def prune_checks(keep_days: int = 90):
 
 # ---------------------------------------------------------------- OSINT results
 
-def save_osint(target: str, tool: str, ok: bool, payload: dict, ms: int | None):
+def save_osint(target: str, tool: str, ok: bool, payload: dict, ms: int | None) -> int:
     with db() as c:
-        c.execute("INSERT INTO osint_results (target, tool, ran_at, ok, ms, result) VALUES (?, ?, ?, ?, ?, ?)",
-                  (target, tool, now_iso(), 1 if ok else 0, ms, gzip.compress(json.dumps(payload).encode())))
+        cur = c.execute("INSERT INTO osint_results (target, tool, ran_at, ok, ms, result) VALUES (?, ?, ?, ?, ?, ?)",
+                        (target, tool, now_iso(), 1 if ok else 0, ms, gzip.compress(json.dumps(payload).encode())))
+        return cur.lastrowid
+
+
+def previous_osint(target: str, tool: str, before_id: int) -> dict | None:
+    """The last successful result of a tool before a given run, for change detection."""
+    with db() as c:
+        r = c.execute("SELECT * FROM osint_results WHERE target = ? AND tool = ? AND ok = 1 AND id < ? ORDER BY id DESC LIMIT 1",
+                      (target, tool, before_id)).fetchone()
+    return {"id": r["id"], "ran_at": r["ran_at"], **json.loads(gzip.decompress(r["result"]))} if r else None
 
 
 def latest_osint(target: str) -> dict:
@@ -436,3 +494,162 @@ def recent_osint_targets(limit: int = 30) -> list[dict]:
 def delete_osint_target(target: str):
     with db() as c:
         c.execute("DELETE FROM osint_results WHERE target = ?", (target,))
+
+
+def previous_analysis(site_id: int, before_id: int, rendered: bool | None = None) -> dict | None:
+    """The iteration before `before_id`. With `rendered`, only one made the same way (with or
+    without the browser), since the two modes detect different technology and score differently."""
+    q, args = "SELECT id FROM analyses WHERE site_id = ? AND id < ?", [site_id, before_id]
+    if rendered is not None:
+        q += " AND COALESCE(json_extract(summary, '$.rendered'), 0) = ?"
+        args.append(1 if rendered else 0)
+    with db() as c:
+        r = c.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
+    return get_analysis(r["id"]) if r else None
+
+
+# ---------------------------------------------------------------- watch schedules
+
+def sites_due_for_watch(kind: str) -> list[dict]:
+    """Sites whose scheduled re-analysis ('analyze') or OSINT refresh ('osint') is due."""
+    hours_col, last_col = ("watch_analyze_hours", "last_watch_analysis_at") if kind == "analyze" else ("watch_osint_hours", "last_watch_osint_at")
+    now = datetime.now(timezone.utc)
+    with db() as c:
+        rows = c.execute(f"SELECT * FROM sites WHERE {hours_col} > 0").fetchall()
+    return [_site_row(r) for r in rows if not r[last_col] or now - parse_iso(r[last_col]) >= timedelta(hours=r[hours_col])]
+
+
+def mark_watch_run(site_id: int, kind: str):
+    col = "last_watch_analysis_at" if kind == "analyze" else "last_watch_osint_at"
+    with db() as c:
+        c.execute(f"UPDATE sites SET {col} = ? WHERE id = ?", (now_iso(), site_id))
+
+
+def site_for_host(host: str) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM sites WHERE host = ? ORDER BY id LIMIT 1", (host,)).fetchone()
+    return _site_row(r) if r else None
+
+
+# ---------------------------------------------------------------- events
+
+def _event_row(r) -> dict:
+    return dict(r) | {"read": bool(r["read"]), "detail": json.loads(r["detail"]), "notified": json.loads(r["notified"])}
+
+
+def add_event(kind: str, severity: str, title: str, *, site_id=None, target=None, detail=None,
+              dedup_key: str | None = None, dedup_days: float | None = None) -> dict | None:
+    """Records an event; returns None when an event with the same dedup_key already exists
+    (within dedup_days, or ever when dedup_days is None)."""
+    with db() as c:
+        if dedup_key:
+            q, args = "SELECT 1 FROM events WHERE dedup_key = ?", [dedup_key]
+            if dedup_days is not None:
+                q += " AND created_at >= ?"
+                args.append((datetime.now(timezone.utc) - timedelta(days=dedup_days)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            if c.execute(q, args).fetchone():
+                return None
+        cur = c.execute("""INSERT INTO events (created_at, site_id, target, kind, severity, title, detail, dedup_key)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (now_iso(), site_id, target, kind, severity, title[:300], json.dumps(detail or {}), dedup_key))
+        return _event_row(c.execute("SELECT * FROM events WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+
+def list_events(*, site_id=None, target=None, min_severity="info", unread_only=False, kind=None,
+                before_id=None, limit=100) -> list[dict]:
+    allowed = [s for s, rank in SEVERITY_RANK.items() if rank >= SEVERITY_RANK.get(min_severity, 0)]
+    where, args = [f"e.severity IN ({','.join('?' * len(allowed))})"], list(allowed)
+    if site_id is not None:
+        where.append("(e.site_id = ? OR e.target = (SELECT host FROM sites WHERE id = ?))"); args += [site_id, site_id]
+    if target:
+        where.append("e.target = ?"); args.append(target)
+    if unread_only:
+        where.append("e.read = 0")
+    if kind:
+        where.append("e.kind = ?"); args.append(kind)
+    if before_id:
+        where.append("e.id < ?"); args.append(before_id)
+    with db() as c:
+        rows = c.execute(f"""SELECT e.*, s.host AS site_host FROM events e LEFT JOIN sites s ON s.id = e.site_id
+                             WHERE {' AND '.join(where)} ORDER BY e.id DESC LIMIT ?""", (*args, limit)).fetchall()
+    return [_event_row(r) for r in rows]
+
+
+def unread_counts() -> dict:
+    with db() as c:
+        rows = c.execute("SELECT severity, COUNT(*) AS n FROM events WHERE read = 0 GROUP BY severity").fetchall()
+    out = {"info": 0, "warning": 0, "critical": 0} | {r["severity"]: r["n"] for r in rows}
+    return out | {"total": sum(out.values())}
+
+
+def mark_events_read(ids: list[int] | None = None, read: bool = True):
+    with db() as c:
+        if ids is None:
+            c.execute("UPDATE events SET read = ?", (1 if read else 0,))
+        elif ids:
+            c.execute(f"UPDATE events SET read = ? WHERE id IN ({','.join('?' * len(ids))})", (1 if read else 0, *ids))
+
+
+def set_event_notified(event_id: int, results: list[dict]):
+    with db() as c:
+        c.execute("UPDATE events SET notified = ? WHERE id = ?", (json.dumps(results), event_id))
+
+
+def delete_events(ids: list[int] | None = None):
+    with db() as c:
+        if ids is None:
+            c.execute("DELETE FROM events")
+        elif ids:
+            c.execute(f"DELETE FROM events WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+
+def prune_events(keep_days: int = 180):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with db() as c:
+        c.execute("DELETE FROM events WHERE created_at < ?", (cutoff,))
+
+
+# ---------------------------------------------------------------- notification channels
+
+def _channel_row(r) -> dict:
+    return dict(r) | {"enabled": bool(r["enabled"])}
+
+
+def list_channels() -> list[dict]:
+    with db() as c:
+        return [_channel_row(r) for r in c.execute("SELECT * FROM channels ORDER BY id").fetchall()]
+
+
+def get_channel(channel_id: int) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+    return _channel_row(r) if r else None
+
+
+def create_channel(kind: str, name: str, target: str, min_severity: str = "warning") -> dict:
+    with db() as c:
+        cur = c.execute("INSERT INTO channels (kind, name, target, min_severity, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (kind, name.strip()[:80], target.strip()[:500], min_severity, now_iso()))
+        return _channel_row(c.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+
+def update_channel(channel_id: int, **fields):
+    allowed = {"name", "target", "min_severity", "enabled"}
+    sets = [(k, (1 if v else 0) if k == "enabled" else v) for k, v in fields.items() if k in allowed and v is not None]
+    if not sets:
+        return
+    with db() as c:
+        c.execute(f"UPDATE channels SET {', '.join(f'{k} = ?' for k, _ in sets)} WHERE id = ?", (*[v for _, v in sets], channel_id))
+
+
+def record_channel_result(channel_id: int, error: str | None):
+    with db() as c:
+        if error:
+            c.execute("UPDATE channels SET last_error = ? WHERE id = ?", (error[:300], channel_id))
+        else:
+            c.execute("UPDATE channels SET last_sent_at = ?, last_error = NULL WHERE id = ?", (now_iso(), channel_id))
+
+
+def delete_channel(channel_id: int):
+    with db() as c:
+        c.execute("DELETE FROM channels WHERE id = ?", (channel_id,))

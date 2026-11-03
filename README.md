@@ -22,8 +22,32 @@ Set the `PORT` environment variable to use a different port.
 | Projects | Group sites together (a client's sites, competitors…). Add sites by URL, re-analyze them all at once, tick two to compare. |
 | Uptime | Every saved site, with optional scheduled monitoring (every 1 min to 24 h). Per site: current status, uptime % for 24h/7d/30d, status timeline, response-time chart, incidents, and a log where you can record outages by hand with a note. |
 | History | Every analysis you've ever run, grouped by day and searchable, so nothing gets lost. |
+| Alerts | What changed between runs, with notification channels and per-site watch schedules (see below). |
 | OSINT | Twelve passive lookups for a domain, run in parallel; each result card fills in as its source answers, and results are saved (see below). |
 | Compare | Two different sites, or two iterations of one site, side by side: a scoreboard of measured metrics (scores, Core Web Vitals, page weight, requests, contrast failures…) with the winner of each, plus tech, issues, security headers, colors and fonts that differ. |
+
+### Change detection and alerts
+
+Every new result is compared with the previous one of the same kind, and differences become events
+(info / warning / critical) shown under **Alerts** and sent to your channels.
+
+| Source | Alerts on |
+|---|---|
+| Analysis (vs. the previous run made the same way, with or without the browser) | Score drops ≥10 (critical ≥25), HTTP status, landing URL, title, technology added/removed/version, security headers removed, page weight +50%, LCP turning poor, 3+ new issues, certificate expiry |
+| OSINT | New subdomains (warning for dev/staging/admin names), NS/MX/A/TXT/CAA changes (load-balancer IP rotation ignored), registrar/nameserver changes, domain expiry (30/7 days) and hold status, certificate expiry (14/3 days), issuer change, TLS 1.0/1.1 re-enabled, DMARC weakened, SPF changed/removed, email grade drop, canonical URL change, HTTP→HTTPS redirect lost, robots.txt blocking everything |
+| Uptime | Site down (confirmed by a second check) and recovered, with downtime |
+
+Repeating alerts (expiry thresholds, header removals) are de-duplicated. **Watching** schedules a full re-analysis and/or
+an OSINT refresh per site (hourly to weekly), or for a whole project at once; schedules only run while the app is running.
+
+**Channels:** Slack (Incoming Webhook URL), Discord (channel webhook URL), generic webhook (JSON POST), or email.
+Email reads its SMTP settings from environment variables so no password is stored in the database:
+
+```
+SMTP_HOST=smtp.example.com SMTP_PORT=587 SMTP_USER=me@example.com SMTP_PASSWORD=… SMTP_FROM=alerts@example.com
+```
+
+Set `APP_URL` to the address the app is reachable at so links in notifications work (default `http://localhost:$PORT`).
 
 ### OSINT tools
 
@@ -46,6 +70,11 @@ All lookups are passive and use public sources only; nothing is scanned or brute
 
 `GET /api/osint/<tool>?target=example.com` runs one tool; `GET /api/osint/saved?target=` returns the latest saved result per tool;
 `GET /api/osint/recent` lists looked-up domains.
+
+Alerts API: `GET /api/events?severity=&site_id=&unread=1&before=`, `GET /api/events/unread`,
+`POST /api/events/read {ids|all, read}`, `POST /api/events/delete {ids|all}`; channels at `GET/POST /api/channels`,
+`PATCH/DELETE /api/channels/<id>`, `POST /api/channels/<id>/test`; schedules via `PATCH /api/sites/<id>`
+`{watch_analyze_hours, watch_osint_hours}` (0, 1, 6, 12, 24, 72 or 168) or `POST /api/projects/<id>/watch` for every site in a project.
 
 Data lives in `data/deconstruct.db` (SQLite, git-ignored). Set `DECONSTRUCT_DB` to store it elsewhere.
 A site counts as **up** when it answers with HTTP status below 400 within 15 seconds.
@@ -92,6 +121,9 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 - `monitor.py` — background thread that checks monitored sites on their interval
 - `compare.py` — diff between two saved reports
 - `osint.py` — the twelve OSINT tools
+- `watch.py` — change-detection rules and the scheduled watcher
+- `notify.py` — Slack, Discord, webhook and email delivery
+- `static/alerts.js` — the Alerts page
 - `static/osint.js` — the OSINT page
 - `static/index.html`, `app.js`, `app.css` — app shell, sidebar and library pages
 - `static/report.js`, `styles.css` — the report view

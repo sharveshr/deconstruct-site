@@ -46,7 +46,11 @@ const parseHash = () => {
 
 async function refreshSidebar() {
   try {
-    const [projects, sites] = await Promise.all([api("/api/projects"), api("/api/sites")]);
+    const [projects, sites, unread] = await Promise.all([api("/api/projects"), api("/api/sites"), api("/api/events/unread")]);
+    const alertCount = unread.critical + unread.warning, ab = $("#alerts-badge");
+    ab.hidden = !alertCount; ab.textContent = alertCount;
+    ab.classList.toggle("warn", !unread.critical);
+    ab.title = `${unread.critical} critical, ${unread.warning} warning unread`;
     const { parts } = parseHash();
     $("#side-projects").innerHTML = projects.length ? projects.slice(0, 12).map(p => `
       <a class="side-proj ${parts[0] === "projects" && +parts[1] === p.id ? "active" : ""}" href="#/projects/${p.id}">
@@ -98,6 +102,7 @@ async function route() {
     if (p0 === "analyses" && p1) return await pageAnalysis(+p1, token);
     if (p0 === "compare") return await pageCompare(q, token);
     if (p0 === "osint") return await pageOsint(q, token);
+    if (p0 === "alerts") return await pageAlerts(q, token);
     view.innerHTML = errorBox("Page not found.");
   } catch (e) {
     if (token === navToken) view.innerHTML = errorBox(e.message);
@@ -189,6 +194,13 @@ async function showResult(res, scroll) {
     ${projects.length ? `<select class="ghost" data-act="addproj" aria-label="Add to project"><option value="">Add to project…</option>
       ${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>` : ""}`;
   renderReport(res.report, root, { analysis_id: res.analysis_id, iteration: res.iteration, site_id: res.site.id, created_at: res.created_at, actions });
+  if (res.events?.length) {
+    const banner = document.createElement("section");
+    banner.className = "card changes-banner";
+    banner.innerHTML = `<h3>${res.events.length} change${res.events.length === 1 ? "" : "s"} since the previous ${res.report.browser?.available ? "browser" : "quick"} analysis</h3>${renderEvents(res.events, { showTarget: false })}`;
+    root.querySelector(".scores").after(banner);
+    wireEvents(banner);
+  }
   root.querySelector('[data-act="addproj"]')?.addEventListener("change", async e => {
     if (!e.target.value) return;
     await api(`/api/projects/${e.target.value}/sites`, { method: "POST", body: { site_id: res.site.id } });
@@ -250,6 +262,7 @@ async function pageProject(id, token) {
       <h1 id="pname">${esc(p.name)}</h1><p id="pdesc">${esc(p.description || "No description")}</p></div>
       <div class="row"><button class="btn" id="rename">Edit</button>
         <button class="btn" id="analyze-all" ${p.sites.length ? "" : "disabled"}>Re-analyze all</button>
+        <a class="btn" href="#/alerts?tab=watching" title="Schedule analyses, OSINT and uptime checks for every site">Watch…</a>
         <button class="btn" id="cmp" disabled title="Tick two sites to compare them">Compare selected</button>
         <button class="btn danger" id="del">Delete</button></div></div>
     <section class="card" style="margin-bottom:16px"><h3>Add a website</h3>
@@ -355,6 +368,7 @@ async function pageSite(id, q, token) {
   if (!view.querySelector(".site-page")) view.innerHTML = loading();
   const [s, projects] = await Promise.all([api(`/api/sites/${id}`), api("/api/projects")]);
   const checks = tab === "uptime" ? await api(`/api/sites/${id}/checks?days=${q.get("range") === "30d" ? 30 : 7}`) : [];
+  const [events, watchInfo] = tab === "alerts" ? await Promise.all([api(`/api/events?site_id=${id}&limit=100`), api("/api/watch")]) : [[], null];
   if (!fresh(token)) return;
   const l = s.latest;
   const otherProjects = projects.filter(p => !s.projects.some(sp => sp.id === p.id));
@@ -370,8 +384,10 @@ async function pageSite(id, q, token) {
         <button class="btn danger" id="del-site">Delete site</button></div></div>
     <nav class="subtabs">
       <a href="#/sites/${id}?tab=iterations" class="${tab === "iterations" ? "on" : ""}">Iterations (${s.iterations.length})</a>
-      <a href="#/sites/${id}?tab=uptime" class="${tab === "uptime" ? "on" : ""}">Uptime & incidents</a></nav>
-    <div id="tab-body">${tab === "uptime" ? renderUptimeTab(s, checks, q.get("range") || "7d") : renderIterationsTab(s)}</div>
+      <a href="#/sites/${id}?tab=uptime" class="${tab === "uptime" ? "on" : ""}">Uptime & incidents</a>
+      <a href="#/sites/${id}?tab=alerts" class="${tab === "alerts" ? "on" : ""}">Alerts & watching</a></nav>
+    <div id="tab-body">${tab === "uptime" ? renderUptimeTab(s, checks, q.get("range") || "7d")
+      : tab === "alerts" ? renderSiteAlertsTab(s, events, watchInfo) : renderIterationsTab(s)}</div>
   </div>`;
 
   $("#addproj")?.addEventListener("change", async e => {
@@ -382,7 +398,34 @@ async function pageSite(id, q, token) {
     if (!confirm(`Delete ${s.host} with all ${s.iterations.length} saved analyses and its uptime history? This can't be undone.`)) return;
     await api(`/api/sites/${id}`, { method: "DELETE" }); location.hash = "#/sites";
   });
-  if (tab === "uptime") wireUptime(s, token); else wireIterations(s);
+  if (tab === "uptime") wireUptime(s, token);
+  else if (tab === "alerts") wireSiteAlerts(s);
+  else wireIterations(s);
+}
+
+function renderSiteAlertsTab(s, events, info) {
+  const sel = (name, value) => `<select class="field" data-watch="${name}">${info.hours.map(h => `<option value="${h}" ${h === value ? "selected" : ""}>${HOURS_LABEL(h)}</option>`).join("")}</select>`;
+  return `<div class="grid" style="margin-bottom:12px">
+    ${card("Watch this site", kv([
+      ["Re-analyze", `${sel("watch_analyze_hours", s.watch_analyze_hours)}${s.last_watch_analysis_at ? ` <span class="muted" style="font-size:12.5px">last ${esc(ago(s.last_watch_analysis_at))}</span>` : ""}`],
+      ["OSINT refresh", `${sel("watch_osint_hours", s.watch_osint_hours)}${s.last_watch_osint_at ? ` <span class="muted" style="font-size:12.5px">last ${esc(ago(s.last_watch_osint_at))}</span>` : ""}`],
+      ["Uptime", `<label class="toggle" style="margin:0"><input type="checkbox" id="w-mon" ${s.monitor_enabled ? "checked" : ""}> Check every ${s.monitor_interval_min} min</label>`]])
+      + `<p class="muted" style="font-size:12.5px;margin:10px 0 0">Each run is compared with the previous one; differences appear below and go to your <a href="#/alerts?tab=channels">notification channels</a>.</p>`)}
+  </div>
+  ${events.length ? renderEvents(events, { showTarget: false })
+    : `<div class="empty"><h3>No alerts for ${esc(s.host)} yet</h3><p>Turn on a schedule above, or re-run an analysis or OSINT lookup; changes from the previous run show up here.</p></div>`}`;
+}
+
+function wireSiteAlerts(s) {
+  view.querySelectorAll("[data-watch]").forEach(sel => sel.addEventListener("change", async () => {
+    await api(`/api/sites/${s.id}`, { method: "PATCH", body: { [sel.dataset.watch]: +sel.value } });
+    toast(+sel.value ? `Scheduled: ${HOURS_LABEL(+sel.value).toLowerCase()}. First run within a minute.` : "Schedule off");
+  }));
+  $("#w-mon")?.addEventListener("change", async e => {
+    await api(`/api/sites/${s.id}`, { method: "PATCH", body: { monitor_enabled: e.target.checked } });
+    toast(e.target.checked ? "Uptime monitoring on" : "Uptime monitoring off"); refreshSidebar();
+  });
+  wireEvents(view.querySelector("#tab-body"), () => route());
 }
 
 function scoreTrend(its) {
