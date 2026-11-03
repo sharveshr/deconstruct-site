@@ -26,6 +26,13 @@ def _fonts(r):
     return [f["value"] for f in (computed or r["design"]["fonts"])][:8]
 
 
+def page_bytes(r):
+    """Bytes the browser actually transferred when available. The HTTP-probe total depends on
+    which files happen to report a Content-Length, so it can double between identical runs."""
+    v = r["performance"].get("vitals") or {}
+    return v.get("transfer_bytes") or r["performance"]["total_known_bytes"]
+
+
 def _delta(a, b):
     if a is None or b is None:
         return None
@@ -79,7 +86,7 @@ def compare(a: dict, b: dict) -> dict:
         "scores": {k: {"from": a["scores"][k], "to": b["scores"][k], "delta": b["scores"][k] - a["scores"][k]} for k in b["scores"]},
         "vitals": vitals,
         "metrics": {
-            "page_bytes": metric(lambda r: r["performance"]["total_known_bytes"]),
+            "page_bytes": metric(page_bytes),
             "requests": metric(lambda r: r["performance"].get("browser_request_count") or r["performance"]["request_count"]),
             "html_bytes": metric(lambda r: r["performance"]["html_size"]),
             "server_ms": metric(lambda r: r["performance"]["server_response_ms"]),

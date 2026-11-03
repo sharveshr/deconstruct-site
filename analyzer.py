@@ -15,6 +15,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import os
 from urllib.parse import urljoin, urlparse
 
 import certifi
@@ -854,9 +855,20 @@ def merge_browser(report, b, resp, raw_html, raw_soup, cookies):
     a11y = accessibility(rsoup)
     c = b["contrast"]
     a11y["contrast"] = c
-    if c["failing_elements"]:
-        a11y["issues"].append(f"{c['failing_elements']} text elements fail WCAG AA color contrast "
-                              f"({c['failing_groups']} color combinations).")
+    axe = b.get("axe") or {}
+    if "violations" in axe:
+        # axe-core covers everything the HTML checks do (alt text, labels, names, headings, lang,
+        # contrast, zoom…) with WCAG mapping, so its findings replace them as the issue list.
+        a11y["axe"] = axe
+        a11y["source"] = "axe-core"
+        order = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
+        a11y["issues"] = [f"{v['help']} ({v['count']} element{'s' if v['count'] != 1 else ''}, {v['impact']})"
+                          for v in sorted(axe["violations"], key=lambda v: (order.get(v["impact"], 4), -v["count"]))]
+    else:
+        a11y["axe_error"] = axe.get("error")
+        if c["failing_elements"]:
+            a11y["issues"].append(f"{c['failing_elements']} text elements fail WCAG AA color contrast "
+                                  f"({c['failing_groups']} color combinations).")
     m = b["mobile"]
     a11y["mobile"] = m
     if m.get("horizontal_overflow"):
@@ -868,12 +880,20 @@ def merge_browser(report, b, resp, raw_html, raw_soup, cookies):
     v = b["vitals"]
     perf = report["performance"]
     perf["vitals"] = v
+    perf["vitals_method"] = b.get("vitals_method", "desktop-unthrottled")
+    perf["vitals_desktop"] = b.get("vitals_desktop")
+    perf["vitals_runs"] = b.get("vitals_runs", [])
+    perf["throttle"] = b.get("throttle")
+    where = "on a throttled mobile load" if perf["vitals_method"] == "mobile-throttled" else "on an unthrottled desktop load"
     labels = {"fcp": "First Contentful Paint", "lcp": "Largest Contentful Paint", "tbt": "Total Blocking Time", "cls": "Cumulative Layout Shift"}
     for k, label in labels.items():
         rating = v["ratings"].get(k)
         if rating in ("poor", "needs-improvement"):
             val = f"{v[k]:.3f}" if k == "cls" else f"{v[k] / 1000:.2f} s" if k != "tbt" else f"{round(v[k])} ms"
-            perf["issues"].insert(0, f"{label} is {val} ({rating.replace('-', ' ')}).")
+            perf["issues"].insert(0, f"{label} is {val} {where} ({rating.replace('-', ' ')}).")
+    failed_runs = [r for r in perf["vitals_runs"] if r.get("error")]
+    if failed_runs and len(failed_runs) == len(perf["vitals_runs"]):
+        perf["issues"].append(f"The page didn't finish loading on a throttled mobile connection: {failed_runs[0]['error']}")
     if b["page_errors"]:
         perf["issues"].append(f"{len(b['page_errors'])} uncaught JavaScript errors during load.")
     if b["failed_requests"] or b["http_errors"]:
@@ -906,17 +926,69 @@ def score(seo_r, a11y_r, sec_r, perf_r):
         perf_points = 100 - 9 * len(perf_r["issues"])
     if perf_r["total_known_bytes"] > 3_000_000:
         perf_points -= 15
+    if a11y_r.get("axe"):
+        # Like Lighthouse: each failed rule costs by impact, however many elements it hits.
+        weight = {"critical": 10, "serious": 7, "moderate": 3, "minor": 1}
+        a11y_points = 100 - sum(weight.get(v["impact"], 3) for v in a11y_r["axe"]["violations"])
+        m = a11y_r.get("mobile") or {}
+        a11y_points -= 5 * bool(m.get("horizontal_overflow")) + 3 * (m.get("small_tap_targets", 0) > 3)
+    else:
+        a11y_points = 100 - 10 * len(a11y_r["issues"])
     return {
         "seo": clamp(100 - 8 * len(seo_r["issues"])),
-        "accessibility": clamp(100 - 10 * len(a11y_r["issues"])),
+        "accessibility": clamp(a11y_points),
         "security": clamp(sec_points),
         "performance": clamp(perf_points),
     }
 
 
+CRUX_METRICS = {
+    "largest_contentful_paint": ("lcp", "Largest Contentful Paint", "ms"),
+    "interaction_to_next_paint": ("inp", "Interaction to Next Paint", "ms"),
+    "cumulative_layout_shift": ("cls", "Cumulative Layout Shift", ""),
+    "first_contentful_paint": ("fcp", "First Contentful Paint", "ms"),
+    "experimental_time_to_first_byte": ("ttfb", "Time to First Byte", "ms"),
+}
+
+
+def field_data(url: str) -> dict:
+    """Real-visitor Core Web Vitals (75th percentile, last 28 days) from the Chrome UX Report.
+    Needs a free API key in CRUX_API_KEY; tries the exact page first, then the whole origin."""
+    key = os.environ.get("CRUX_API_KEY")
+    if not key:
+        return {"available": False, "reason": "no_key"}
+    origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    for scope, query in (("page", {"url": url}), ("origin", {"origin": origin})):
+        try:
+            r = requests.post(f"https://chromeuxreport.googleapis.com/v1/records:queryRecord?key={key}",
+                              json=query | {"formFactor": "PHONE"}, timeout=10)
+        except requests.RequestException as e:
+            return {"available": False, "reason": "error", "error": type(e).__name__}
+        if r.status_code == 404:
+            continue
+        if r.status_code >= 400:
+            msg = (r.json().get("error") or {}).get("message", f"HTTP {r.status_code}") if r.headers.get("content-type", "").startswith("application/json") else f"HTTP {r.status_code}"
+            return {"available": False, "reason": "error", "error": msg[:200]}
+        rec = r.json().get("record", {})
+        metrics = {}
+        for name, (short, label, unit) in CRUX_METRICS.items():
+            m = rec.get("metrics", {}).get(name)
+            if not m:
+                continue
+            p75 = m.get("percentiles", {}).get("p75")
+            p75 = float(p75) if p75 is not None else None
+            dist = [round(h.get("density", 0) * 100, 1) for h in m.get("histogram", [])]
+            metrics[short] = {"label": label, "p75": p75, "unit": unit, "distribution": dist}
+        cp = r.json().get("record", {}).get("collectionPeriod", {})
+        fmt = lambda d: f"{d.get('year')}-{d.get('month'):02d}-{d.get('day'):02d}" if d else None
+        return {"available": True, "scope": scope, "form_factor": "phone", "metrics": metrics,
+                "period": [fmt(cp.get("firstDate")), fmt(cp.get("lastDate"))]}
+    return {"available": False, "reason": "not_enough_traffic"}
+
+
 # ---------------------------------------------------------------- entry
 
-def analyze(raw_url: str, render: bool = True) -> dict:
+def analyze(raw_url: str, render: bool = True, perf_runs: int = browser.DEFAULT_PERF_RUNS) -> dict:
     url = normalize_url(raw_url)
     session = _session()
     t0 = time.perf_counter()
@@ -938,8 +1010,9 @@ def analyze(raw_url: str, render: bool = True) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     cookies = _set_cookie_headers(resp)
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        browser_f = pool.submit(browser.analyze_rendered, final_url, _host_is_public) if render else None
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        browser_f = pool.submit(browser.analyze_rendered, final_url, _host_is_public, perf_runs) if render else None
+        field_f = pool.submit(field_data, final_url)
         css_f = pool.submit(fetch_css, session, soup, final_url)
         res_f = pool.submit(probe_resources, session, collect_resources(soup, final_url))
         sec_f = pool.submit(security, session, resp, final_url, cookies, soup)
@@ -965,6 +1038,7 @@ def analyze(raw_url: str, render: bool = True) -> dict:
         merge_browser(report, browser_r, resp, html, soup, cookies)
     else:
         report["browser"] = browser_r
+    report["performance"]["field"] = field_f.result()
     report["analysis_ms"] = round((time.perf_counter() - t0) * 1000)
     report["scores"] = score(report["seo"], report["accessibility"], sec_r, report["performance"])
     report["overview"]["http_version"] = "HTTP/2" if sec_r.get("alpn") == "h2" else report["overview"]["http_version"]

@@ -8,6 +8,8 @@ run from a worker thread.
 from __future__ import annotations
 
 import base64
+import os
+import statistics
 import time
 from urllib.parse import urlparse
 
@@ -28,7 +30,45 @@ MOBILE_UA = (
     "(KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36 DeconstructSite/1.0"
 )
 NAV_TIMEOUT_MS = 25_000
+THROTTLED_NAV_TIMEOUT_MS = 45_000
 MAX_FULLPAGE_HEIGHT = 5000
+DEFAULT_PERF_RUNS = 3
+
+# A mid-range phone on a typical 4G connection (Chrome DevTools' "Fast 4G" preset with a 4x CPU slowdown),
+# so lab vitals reflect a realistic visitor rather than this machine's fast desktop connection.
+# Lighthouse's harsher "Slow 4G" (1.6 Mbps, 562 ms per request) made heavy pages take 25+ s per load here,
+# because DevTools adds the latency to every request; its own scores use simulation instead.
+THROTTLE = {"name": "Fast 4G, 4× CPU slowdown", "latency_ms": 60, "down_bps": 9 * 1024 * 1024 / 8,
+            "up_bps": 1.5 * 1024 * 1024 / 8, "cpu": 4}
+PERF_VIEWPORT = {"width": 412, "height": 823}
+
+try:
+    import axe_playwright_python as _axe_pkg
+    AXE_JS = os.path.join(os.path.dirname(_axe_pkg.__file__), "axe.min.js")
+    if not os.path.exists(AXE_JS):
+        AXE_JS = None
+except ImportError:
+    AXE_JS = None
+
+_axe_source = None
+AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"]
+RUN_AXE = """
+async (tags) => {
+  // preload:false stops axe re-fetching cross-origin stylesheets, which caused CORS errors
+  // that would show up as if the site had them.
+  const r = await axe.run(document, { runOnly: { type: 'tag', values: tags }, resultTypes: ['violations'], preload: false });
+  const trim = s => s && s.length > 240 ? s.slice(0, 240) + '…' : s;
+  return {
+    version: axe.version,
+    violations: r.violations.map(v => ({
+      id: v.id, impact: v.impact, help: v.help, description: v.description, help_url: v.helpUrl,
+      tags: v.tags.filter(t => /^wcag\\d|best-practice/.test(t)), count: v.nodes.length,
+      nodes: v.nodes.slice(0, 8).map(n => ({ target: [].concat(n.target).join(' '), html: trim(n.html), summary: trim(n.failureSummary) })),
+    })),
+    passes: r.passes.length, incomplete: r.incomplete.length, inapplicable: r.inapplicable.length,
+  };
+}
+"""
 
 # Installed before any page script runs, so buffered entries are never missed.
 VITALS_INIT = """
@@ -37,6 +77,7 @@ VITALS_INIT = """
   const obs = (type, fn) => { try { new PerformanceObserver(l => l.getEntries().forEach(fn)).observe({ type, buffered: true }); } catch (e) {} };
   obs('largest-contentful-paint', e => {
     s.lcp = e.startTime;
+    s.lcpAt = performance.now();
     const el = e.element;
     s.lcpEl = el ? (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.') : '')) + (e.url ? ' ' + e.url : '') : null;
   });
@@ -274,6 +315,16 @@ def _settle(page):
         pass
 
 
+def _await_lcp(page, timeout_ms=12000):
+    """Waits until Largest Contentful Paint has stopped changing for 2 s. Animated or late-loading
+    hero content can be painted well after the load event, and reading earlier misses it."""
+    try:
+        page.wait_for_function("() => window.__ss && window.__ss.lcp !== null && performance.now() - window.__ss.lcpAt > 2000",
+                               timeout=timeout_ms, polling=250)
+    except PlaywrightTimeout:
+        pass
+
+
 def _element_shot(page, selectors):
     for sel in selectors:
         loc = page.locator(sel).first
@@ -290,11 +341,98 @@ def _element_shot(page, selectors):
     return None
 
 
-def analyze_rendered(url: str, is_public) -> dict:
+def _run_axe(page) -> dict:
+    """Runs axe-core's WCAG 2.x A/AA and best-practice rules on the loaded page."""
+    global _axe_source
+    if not AXE_JS:
+        return {"error": "axe-core isn't installed (pip install axe-playwright-python)."}
+    try:
+        if _axe_source is None:
+            with open(AXE_JS, encoding="utf-8") as f:
+                _axe_source = f.read() + "\n;true"
+        # Evaluated through DevTools rather than injected as a <script>, so the page's
+        # Content-Security-Policy doesn't block it and the page itself runs unmodified.
+        page.evaluate(_axe_source)
+        return page.evaluate(RUN_AXE, AXE_TAGS)
+    except PlaywrightError as e:
+        return {"error": f"axe-core couldn't run on this page: {str(e).splitlines()[0][:160]}"}
+
+
+def _rate_all(v: dict) -> dict:
+    return {
+        "fcp": _rate(v.get("fcp"), 1800, 3000),
+        "lcp": _rate(v.get("lcp"), 2500, 4000),
+        "cls": _rate(v.get("cls"), 0.1, 0.25),
+        "tbt": _rate(v.get("tbt"), 200, 600),
+        "ttfb": _rate(v.get("ttfb"), 800, 1800),
+    }
+
+
+def _perf_run(browser, url, is_public, capture_mobile: bool) -> dict:
+    """One cold, throttled mobile load. Returns its vitals (and, if asked, the mobile
+    screenshot and layout checks, which don't depend on throttling)."""
+    ctx = browser.new_context(viewport=PERF_VIEWPORT, user_agent=MOBILE_UA, is_mobile=True, has_touch=True,
+                              device_scale_factor=1.75, service_workers="block")
+    try:
+        _guard_routes(ctx, is_public)
+        ctx.add_init_script(VITALS_INIT)
+        page = ctx.new_page()
+        cdp = ctx.new_cdp_session(page)
+        cdp.send("Network.enable")
+        cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        cdp.send("Network.emulateNetworkConditions", {"offline": False, "latency": THROTTLE["latency_ms"],
+                                                      "downloadThroughput": THROTTLE["down_bps"], "uploadThroughput": THROTTLE["up_bps"]})
+        cdp.send("Emulation.setCPUThrottlingRate", {"rate": THROTTLE["cpu"]})
+        t0 = time.perf_counter()
+        page.goto(url, wait_until="load", timeout=THROTTLED_NAV_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeout:
+            pass
+        _await_lcp(page)
+        out = {"vitals": page.evaluate(COLLECT_VITALS), "wall_ms": round((time.perf_counter() - t0) * 1000)}
+        if capture_mobile:
+            cdp.send("Emulation.setCPUThrottlingRate", {"rate": 1})
+            try:
+                out["mobile"] = page.evaluate(MOBILE_CHECKS)
+                out["mobile"]["screenshot"] = _jpeg(page.screenshot(type="jpeg", quality=72))
+            except PlaywrightError as e:
+                out["mobile"] = {"error": str(e).splitlines()[0][:200]}
+        return out
+    except PlaywrightTimeout:
+        return {"error": f"Didn't finish loading within {THROTTLED_NAV_TIMEOUT_MS // 1000} s on a throttled connection."}
+    except PlaywrightError as e:
+        return {"error": str(e).splitlines()[0][:200]}
+    finally:
+        ctx.close()
+
+
+METRICS = ("ttfb", "fcp", "lcp", "cls", "tbt", "load", "dom_content_loaded")
+
+
+def _median_vitals(runs: list[dict]) -> dict | None:
+    ok = [r["vitals"] for r in runs if "vitals" in r]
+    if not ok:
+        return None
+    out = {}
+    for k in METRICS:
+        vals = [v[k] for v in ok if v.get(k) is not None]
+        out[k] = statistics.median(vals) if vals else None
+        out[f"{k}_range"] = [min(vals), max(vals)] if len(vals) > 1 else None
+    # Report the LCP element and counts from the run closest to the median LCP.
+    closest = min(ok, key=lambda v: abs((v.get("lcp") or 0) - (out["lcp"] or 0)))
+    out |= {k: closest.get(k) for k in ("lcp_element", "long_tasks", "transfer_bytes", "dom_nodes", "js_heap")}
+    out["runs"] = len(ok)
+    out["ratings"] = _rate_all(out)
+    return out
+
+
+def analyze_rendered(url: str, is_public, perf_runs: int = DEFAULT_PERF_RUNS) -> dict:
     if not AVAILABLE:
         return {"available": False, "error": "Playwright is not installed."}
     t0 = time.perf_counter()
     console, page_errors, failed, requests_seen = [], [], [], []
+    perf = []
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
@@ -315,7 +453,7 @@ def analyze_rendered(url: str, is_public) -> dict:
 
                 resp = page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
                 _settle(page)
-                page.wait_for_timeout(800)
+                _await_lcp(page, timeout_ms=8000)
 
                 vitals = page.evaluate(COLLECT_VITALS)
                 above_fold = _jpeg(page.screenshot(type="jpeg", quality=72))
@@ -327,6 +465,7 @@ def analyze_rendered(url: str, is_public) -> dict:
                     "footer": _element_shot(page, ["footer", "[role=contentinfo]"]),
                     "form": _element_shot(page, ["form"]),
                 }
+                axe = _run_axe(page)
                 # Scroll through once so lazy images load before the full-page capture.
                 height = page.evaluate("document.documentElement.scrollHeight")
                 for y in range(0, min(height, MAX_FULLPAGE_HEIGHT), 700):
@@ -342,19 +481,12 @@ def analyze_rendered(url: str, is_public) -> dict:
                 status = resp.status if resp else None
                 ctx.close()
 
-                mctx = browser.new_context(viewport={"width": 390, "height": 844}, user_agent=MOBILE_UA,
-                                           is_mobile=True, has_touch=True, device_scale_factor=1, service_workers="block")
-                _guard_routes(mctx, is_public)
-                mpage = mctx.new_page()
-                mobile = {}
-                try:
-                    mpage.goto(final_url, wait_until="load", timeout=NAV_TIMEOUT_MS)
-                    _settle(mpage)
-                    mobile = mpage.evaluate(MOBILE_CHECKS)
-                    mobile["screenshot"] = _jpeg(mpage.screenshot(type="jpeg", quality=72))
-                except PlaywrightError as e:
-                    mobile = {"error": str(e).splitlines()[0][:200]}
-                mctx.close()
+                # Throttled mobile runs, one after another so they don't compete for CPU.
+                for i in range(max(1, perf_runs)):
+                    perf.append(_perf_run(browser, final_url, is_public, capture_mobile=(i == 0)))
+                    if i == 0 and "error" in perf[0] and "Didn't finish" in perf[0]["error"]:
+                        break   # a page that can't load once won't load on the next tries either
+                mobile = perf[0].pop("mobile", None) or {"error": perf[0].get("error", "Mobile view not captured.")}
             finally:
                 browser.close()
     except PlaywrightTimeout:
@@ -368,18 +500,20 @@ def analyze_rendered(url: str, is_public) -> dict:
     by_type = {}
     for r in requests_seen:
         by_type[r["type"]] = by_type.get(r["type"], 0) + 1
-    vitals["ratings"] = {
-        "fcp": _rate(vitals["fcp"], 1800, 3000),
-        "lcp": _rate(vitals["lcp"], 2500, 4000),
-        "cls": _rate(vitals["cls"], 0.1, 0.25),
-        "tbt": _rate(vitals["tbt"], 200, 600),
-        "ttfb": _rate(vitals["ttfb"], 800, 1800),
-    }
+    vitals["ratings"] = _rate_all(vitals)
+    mobile_vitals = _median_vitals(perf)
     return {
         "available": True,
         "final_url": final_url,
         "status": status,
-        "vitals": vitals,
+        # Throttled mobile median when it worked; otherwise the single unthrottled desktop load.
+        "vitals": mobile_vitals or vitals,
+        "vitals_method": "mobile-throttled" if mobile_vitals else "desktop-unthrottled",
+        "vitals_desktop": vitals,
+        "vitals_runs": [{"wall_ms": r.get("wall_ms"), "error": r.get("error"),
+                         **({k: r["vitals"].get(k) for k in METRICS} if "vitals" in r else {})} for r in perf],
+        "throttle": THROTTLE | {"viewport": PERF_VIEWPORT},
+        "axe": axe,
         "screenshots": {"above_fold": above_fold, "full_page": full_page, "full_page_height": full_h,
                         "page_height": height, "mobile": mobile.pop("screenshot", None)},
         "mobile": mobile,

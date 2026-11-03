@@ -90,9 +90,9 @@ load of the page (can be switched off with the checkbox, or `"render": false` in
 | Technology | ~110 HTML/header fingerprints plus ~55 runtime checks (`window.next.version`, React fibers, `jQuery.fn.jquery`…) with evidence |
 | Design | Colors by painted area, fonts by amount of text, typography per tag, rebuilt buttons, plus CSS palette, type/spacing scales, radii, shadows, breakpoints, motion, variables |
 | Screenshots | Full page (up to 5000px) and header/footer/form component shots |
-| Performance | Lab Core Web Vitals (LCP, FCP, TBT, CLS, TTFB) with LCP element, console and network errors, every resource with size/time/compression/caching |
+| Performance | Lab Core Web Vitals (LCP, FCP, TBT, CLS, TTFB) as the median of 1–5 cold mobile loads on 4G (9 Mbps, 60 ms, 4× CPU slowdown) with the spread across runs and an unthrottled desktop load for comparison; optional real-user p75 vitals from the Chrome UX Report; LCP element, console and network errors, every resource with size/time/compression/caching |
 | SEO | Title/description, canonical, Open Graph/Twitter, JSON-LD, robots.txt, sitemap, soft-404, JS-only content warning |
-| Accessibility | WCAG AA contrast on rendered text, mobile overflow and tap targets, lang, alt text, labels, nameless controls, heading order |
+| Accessibility | axe-core (WCAG 2.0–2.2 A/AA and best practices) on the rendered page, with impact, affected elements and fix links; mobile overflow and tap targets. Falls back to basic HTML checks without the browser |
 | Security | TLS certificate, HTTPS redirect, security headers, cookies, mixed content, SRI, version leaks |
 | Structure | Heading outline, nav, links, social/contact, forms, iframes, word count (from the rendered DOM) |
 
@@ -130,7 +130,13 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 
 ## Notes
 
-- Vitals are a single unthrottled lab load from this machine; real users on slower devices see higher numbers.
+- Lab vitals emulate a mid-range phone on 4G with Chrome DevTools throttling. They're more realistic than an
+  unthrottled load but are not the same as PageSpeed Insights' simulated scores. TTFB is the server's own response
+  time (Chrome applies emulated latency after it). For what real visitors experience, set `CRUX_API_KEY` to a free
+  [Chrome UX Report API key](https://developer.chrome.com/docs/crux/api); sites without enough Chrome traffic have no field data.
+- `POST /api/analyze` accepts `perf_runs` (1–5, default 3). Alerts only compare runs measured the same way, so the
+  first throttled run of a site never raises false score or vitals alerts against older desktop-measured runs.
+- Page weight in comparisons and alerts uses the bytes the browser actually transferred, which is stable between runs.
 - Every request the browser makes is checked, and requests to private/loopback addresses are aborted,
   so a page can't use the server's browser to probe its local network.
 - Sites behind bot challenges (e.g. Cloudflare "checking your browser") may show the challenge page.

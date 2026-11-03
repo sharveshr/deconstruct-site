@@ -123,3 +123,15 @@ footer { color: var(--ink-3); font-size: 13px; padding: 30px 0 40px; }
   form.search { flex-direction: column; } button.primary { padding: 12px; }
   .wrap { padding: 0 16px; }
 }
+
+/* throttled vitals, field data, axe-core */
+.vital .vr { font-size: 11px; color: var(--ink-3); font-family: var(--mono); margin-top: -2px; }
+.dist { display: flex; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 8px; background: var(--panel-2); }
+.dist i { display: block; height: 100%; }
+.dist i.g { background: var(--good); } .dist i.n { background: var(--warn); } .dist i.p { background: var(--bad); }
+.axe-rule { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--panel); }
+.axe-rule summary { cursor: pointer; font-size: 14px; line-height: 1.7; }
+.axe-tags { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: 6px; vertical-align: middle; }
+.axe-tags .pill { font-size: 11px; }
+.axe-node { border-top: 1px solid var(--line); padding: 8px 0; }
+.axe-node code { display: block; font-family: var(--mono); font-size: 11.5px; background: var(--panel-2); padding: 6px 8px; border-radius: 6px; margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
