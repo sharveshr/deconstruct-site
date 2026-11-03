@@ -168,15 +168,52 @@ function renderShots(d) {
   </div>`;
 }
 
-function renderVitals(v) {
-  const fmt = { ttfb: x => (x / 1000).toFixed(2) + " s", fcp: x => (x / 1000).toFixed(2) + " s", lcp: x => (x / 1000).toFixed(2) + " s",
-    tbt: x => Math.round(x) + " ms", cls: x => x.toFixed(3) };
-  const names = { lcp: "Largest Contentful Paint", fcp: "First Contentful Paint", tbt: "Total Blocking Time", cls: "Cumulative Layout Shift", ttfb: "Time to First Byte" };
+const VITAL_FMT = { ttfb: x => (x / 1000).toFixed(2) + " s", fcp: x => (x / 1000).toFixed(2) + " s", lcp: x => (x / 1000).toFixed(2) + " s",
+  tbt: x => Math.round(x) + " ms", cls: x => x.toFixed(3), inp: x => Math.round(x) + " ms", load: x => (x / 1000).toFixed(2) + " s" };
+const VITAL_LIMITS = { lcp: [2500, 4000], fcp: [1800, 3000], tbt: [200, 600], cls: [0.1, 0.25], ttfb: [800, 1800], inp: [200, 500] };
+const rateVital = (k, x) => x == null || !VITAL_LIMITS[k] ? "" : x <= VITAL_LIMITS[k][0] ? "good" : x > VITAL_LIMITS[k][1] ? "poor" : "needs-improvement";
+
+// p is the report's performance section (older saved reports only have p.vitals from one desktop load).
+function renderVitals(p) {
+  const v = p.vitals, mobile = p.vitals_method === "mobile-throttled", t = p.throttle;
+  const names = { lcp: "Largest Contentful Paint", fcp: "First Contentful Paint", tbt: "Total Blocking Time", cls: "Cumulative Layout Shift", ttfb: "Server response (TTFB)" };
+  const range = k => v[`${k}_range`] && v[`${k}_range`][0] !== v[`${k}_range`][1]
+    ? `<div class="vr">${VITAL_FMT[k](v[`${k}_range`][0])} – ${VITAL_FMT[k](v[`${k}_range`][1])}</div>` : "";
+  const how = mobile
+    ? `Median of ${v.runs} cold load${v.runs === 1 ? "" : "s"} as a mid-range phone on 4G: ${esc(t?.name || "throttled")} (${Math.round(t.down_bps * 8 / 1024 / 1024)} Mbps, ${t.latency_ms} ms latency, ${t.viewport.width}×${t.viewport.height}).
+       Ranges show the spread across runs. TTFB is the server's own response time; throttling adds its latency afterwards.`
+    : "One unthrottled desktop load on this machine. Re-analyze to get throttled mobile measurements.";
+  const d = p.vitals_desktop;
+  const runs = (p.vitals_runs || []);
   return `<div class="vitals">${Object.entries(names).map(([k, n]) => `<div class="vital ${v.ratings[k] || ""}">
-    <div class="v">${v[k] == null ? "—" : fmt[k](v[k])}</div><div class="k">${n}</div><div class="r">${esc((v.ratings[k] || "n/a").replace("-", " "))}</div></div>`).join("")}</div>
+    <div class="v">${v[k] == null ? "—" : VITAL_FMT[k](v[k])}</div>${range(k)}<div class="k">${n}</div><div class="r">${esc((v.ratings[k] || "n/a").replace("-", " "))}</div></div>`).join("")}</div>
     ${v.lcp_element ? `<p class="muted" style="font-size:12.5px;margin:12px 0 0">LCP element: <span class="mono">${esc(v.lcp_element.slice(0, 160))}</span></p>` : ""}
-    <p class="muted" style="font-size:12.5px;margin:6px 0 0">Lab measurement from one load on this server (no throttling), so real visitors on slower devices will see higher numbers.
-    Load event ${v.load ? (v.load / 1000).toFixed(2) + " s" : "—"} · ${bytes(v.transfer_bytes)} transferred · ${v.dom_nodes.toLocaleString()} DOM nodes · ${v.long_tasks} long tasks</p>`;
+    <p class="muted" style="font-size:12.5px;margin:6px 0 0">${how}</p>
+    ${mobile && d ? `<p style="font-size:12.5px;margin:6px 0 0"><b>Unthrottled desktop load for comparison:</b> LCP ${d.lcp != null ? VITAL_FMT.lcp(d.lcp) : "—"} · FCP ${d.fcp != null ? VITAL_FMT.fcp(d.fcp) : "—"} · TBT ${d.tbt != null ? VITAL_FMT.tbt(d.tbt) : "—"} · CLS ${d.cls != null ? VITAL_FMT.cls(d.cls) : "—"}</p>` : ""}
+    ${runs.length > 1 || runs.some(r => r.error) ? `<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12.5px">Individual runs</summary>
+      <div class="table-scroll"><table><thead><tr><th>Run</th><th>FCP</th><th>LCP</th><th>TBT</th><th>CLS</th><th>Load</th></tr></thead>
+      ${runs.map((r, i) => `<tr><td>${i + 1}</td>${r.error ? `<td colspan="5" class="muted">${esc(r.error)}</td>` : ["fcp", "lcp", "tbt", "cls", "load"].map(k => `<td class="mono">${r[k] != null ? VITAL_FMT[k](r[k]) : "—"}</td>`).join("")}</tr>`).join("")}</table></div></details>` : ""}
+    <p class="muted" style="font-size:12.5px;margin:6px 0 0">Load event ${v.load ? (v.load / 1000).toFixed(2) + " s" : "—"} · ${bytes(v.transfer_bytes)} transferred · ${(v.dom_nodes || 0).toLocaleString()} DOM nodes · ${v.long_tasks ?? "—"} long tasks</p>`;
+}
+
+function renderField(f) {
+  if (!f) return "";
+  if (!f.available) {
+    const msg = {
+      no_key: `Set a free Chrome UX Report API key in <span class="mono">CRUX_API_KEY</span> to see what real Chrome users experienced on this site over the last 28 days.
+        <a href="https://developer.chrome.com/docs/crux/api" target="_blank" rel="noopener noreferrer">Get a key</a>.`,
+      not_enough_traffic: "Google has no real-user data for this page or site: it doesn't get enough Chrome traffic to be in the Chrome UX Report.",
+      error: `Couldn't read the Chrome UX Report: ${esc(f.error || "unknown error")}.`,
+    }[f.reason] || "No field data.";
+    return card("Real-user data (Chrome UX Report)", `<p class="muted" style="font-size:13.5px;margin:0">${msg}</p>`, "wide");
+  }
+  const order = ["lcp", "inp", "cls", "fcp", "ttfb"].filter(k => f.metrics[k]);
+  return card(`Real-user data · ${f.scope === "page" ? "this page" : "whole site"} · phones`, `<div class="vitals">${order.map(k => {
+      const m = f.metrics[k], r = rateVital(k, m.p75), [g, ni, poor] = m.distribution.concat([0, 0, 0]);
+      return `<div class="vital ${r}"><div class="v">${m.p75 == null ? "—" : VITAL_FMT[k](m.p75)}</div><div class="k">${esc(m.label)}</div><div class="r">${esc(r.replace("-", " ") || "n/a")} · p75</div>
+        <div class="dist" title="${g}% good · ${ni}% needs improvement · ${poor}% poor"><i class="g" style="width:${g}%"></i><i class="n" style="width:${ni}%"></i><i class="p" style="width:${poor}%"></i></div></div>`;
+    }).join("")}</div>
+    <p class="muted" style="font-size:12.5px;margin:10px 0 0">75th percentile of real Chrome visitors on phones, ${esc(f.period?.[0] || "")} to ${esc(f.period?.[1] || "")}. Bars show the share of visits rated good / needs improvement / poor. This is what Google uses for Core Web Vitals in search.</p>`, "wide");
 }
 
 function renderPerf(d) {
@@ -185,7 +222,8 @@ function renderPerf(d) {
   const errs = b?.available ? [...b.page_errors.map(e => ["bad", `Uncaught: ${e}`]), ...b.console.map(c => [c.type === "error" ? "bad" : "", `${c.type}: ${c.text}`]),
     ...b.failed_requests.map(f => ["bad", `Failed ${f.type}: ${f.url} (${f.error})`]), ...b.http_errors.map(h => ["bad", `HTTP ${h.status} ${h.type}: ${h.url}`])] : [];
   return `<div class="grid">
-    ${p.vitals ? card("Core Web Vitals (lab)", renderVitals(p.vitals), "wide") : ""}
+    ${p.vitals ? card(p.vitals_method === "mobile-throttled" ? "Core Web Vitals · lab · mobile on 4G" : "Core Web Vitals · lab · desktop", renderVitals(p), "wide") : ""}
+    ${renderField(p.field)}
     ${b?.available ? card(`Console & network errors (${errs.length})`, errs.length ? `<div style="max-height:320px;overflow:auto">${errs.map(([lvl, e]) => `<div class="issue"><span class="dot ${lvl}"></span><span class="mono" style="font-size:12px;overflow-wrap:anywhere">${esc(e)}</span></div>`).join("")}</div>`
       : '<div class="issue"><span class="dot good"></span><span>No console errors or failed requests.</span></div>', "wide") : ""}
     ${card("Summary", kv([["Server response", `${p.server_response_ms} ms`], ["HTML", `${bytes(p.html_size)} ${p.html_compression ? `<span class="pill good">${esc(p.html_compression)}</span>` : '<span class="pill bad">uncompressed</span>'}`],
@@ -217,9 +255,44 @@ function renderSeo(d) {
   </div>`;
 }
 
+function renderAxe(axe) {
+  const impacts = ["critical", "serious", "moderate", "minor"];
+  const counts = Object.fromEntries(impacts.map(i => [i, axe.violations.filter(v => v.impact === i).length]));
+  const cls = { critical: "bad", serious: "bad", moderate: "warn", minor: "" };
+  const tag = t => t === "best-practice" ? "Best practice"
+    // wcag2a → WCAG 2.0 A, wcag21aa → WCAG 2.1 AA, wcag143 → SC 1.4.3, wcag1412 → SC 1.4.12
+    : /^wcag\d\d?a+$/.test(t) ? t.replace(/^wcag(\d)(\d?)(a+)$/, (m, a, b, l) => `WCAG ${a}.${b || 0} ${l.toUpperCase()}`)
+    : t.replace(/^wcag(\d)(\d)(\d+)$/, (m, a, b, c) => `SC ${a}.${b}.${c}`);
+  const list = [...axe.violations].sort((a, b) => impacts.indexOf(a.impact) - impacts.indexOf(b.impact) || b.count - a.count);
+  return `<div class="row" style="gap:8px;margin-bottom:12px">
+      ${impacts.map(i => `<span class="pill ${counts[i] ? cls[i] : ""}">${counts[i]} ${i}</span>`).join("")}
+      <span class="pill good">${axe.passes} rules passed</span>${axe.incomplete ? `<span class="pill" title="Rules axe couldn't decide automatically">${axe.incomplete} need manual review</span>` : ""}</div>
+    ${list.length ? list.map(v => `<details class="axe-rule"><summary>
+        <span class="pill ${cls[v.impact] || ""}">${esc(v.impact || "unknown")}</span> <b>${esc(v.help)}</b>
+        <span class="muted">· ${v.count} element${v.count === 1 ? "" : "s"}</span>
+        <span class="axe-tags">${v.tags.map(t => `<span class="pill">${esc(tag(t))}</span>`).join("")}</span></summary>
+      <p style="font-size:13.5px;margin:8px 0">${esc(v.description)} <a href="${esc(v.help_url)}" target="_blank" rel="noopener noreferrer">How to fix ↗</a></p>
+      ${v.nodes.map(n => `<div class="axe-node"><div class="mono" style="font-size:11.5px;color:var(--ink-3)">${esc(n.target)}</div>
+        <code>${esc(n.html)}</code>${n.summary ? `<div style="font-size:12.5px;color:var(--ink-2);white-space:pre-line">${esc(n.summary)}</div>` : ""}</div>`).join("")}
+      ${v.count > v.nodes.length ? `<div class="muted" style="font-size:12.5px">…and ${v.count - v.nodes.length} more elements</div>` : ""}
+    </details>`).join("")
+      : '<div class="issue"><span class="dot good"></span><span>No WCAG A/AA or best-practice violations found by axe-core.</span></div>'}`;
+}
+
 function renderA11y(d) {
   const a = d.accessibility;
+  if (a.axe) {
+    return `<div class="grid">
+      ${card(`axe-core ${esc(a.axe.version)} · WCAG 2.2 A/AA and best practices`, renderAxe(a.axe), "wide")}
+      ${a.mobile && !a.mobile.error ? card(`Mobile (${a.mobile.viewport_width}px)`, kv([["Sideways scrolling", yes(!a.mobile.horizontal_overflow, "None", `Yes — ${a.mobile.page_width}px wide`)],
+        ["Small tap targets (<24px)", a.mobile.small_tap_targets], ["Body text size", `${a.mobile.body_font_px}px`]])) : ""}
+      ${card("Page basics", kv([["Page language", a.lang ? `<span class="pill good">${esc(a.lang)}</span>` : '<span class="pill bad">Missing</span>'],
+        ["Skip-to-content link", yes(a.skip_link)], ["Images", a.images], ["ARIA attributes", a.aria_attributes]]))}
+      <p class="muted card wide" style="font-size:13px;margin:0">Checked by axe-core on the rendered page. Automated tools can't judge everything: keyboard navigation, focus order, screen-reader announcements and whether alt text is meaningful still need a manual test.</p>
+    </div>`;
+  }
   return `<div class="grid">
+    ${a.axe_error ? `<div class="issue card wide" style="margin:0"><span class="dot"></span><span>${esc(a.axe_error)} Showing the basic HTML checks instead.</span></div>` : ""}
     ${card("Checks", kv([["Page language", a.lang ? `<span class="pill good">${esc(a.lang)}</span>` : '<span class="pill bad">Missing</span>'],
       ["Images missing alt", `${a.images_missing_alt} of ${a.images}`], ["Unlabeled form fields", a.unlabeled_fields],
       ["Buttons without a name", a.nameless_buttons], ["Links without a name", a.nameless_links], ["Heading level skips", a.heading_skips],

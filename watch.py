@@ -101,8 +101,7 @@ def _tech_changes(ev: _Collector, host: str, added, removed, versions):
 
 def detect_analysis(site: dict, analysis_id: int, report: dict) -> list[dict]:
     host = site["host"]
-    rendered = bool((report.get("browser") or {}).get("available"))
-    prev = store.previous_analysis(site["id"], analysis_id, rendered=rendered)
+    prev = store.previous_analysis(site["id"], analysis_id, mode=store.analysis_mode(report))
     ev = _Collector(site_id=site["id"], target=host,
                     links={"analysis": analysis_id, **({"compare": [prev["id"], analysis_id]} if prev else {})})
     tls = (report.get("security") or {}).get("tls") or {}

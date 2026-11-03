@@ -59,7 +59,11 @@ def api_analyze():
     if not url:
         return fail("Enter a URL.")
     try:
-        report = analyze(url, render=b.get("render", True) is not False)
+        runs = max(1, min(5, int(b.get("perf_runs", 3))))
+    except (TypeError, ValueError):
+        return fail("perf_runs must be a number from 1 to 5.")
+    try:
+        report = analyze(url, render=b.get("render", True) is not False, perf_runs=runs)
     except AnalysisError as e:
         return fail(str(e), 422)
     saved = watch.save_analysis(url, report, label=str(b.get("label", "")), project_id=b.get("project_id"))

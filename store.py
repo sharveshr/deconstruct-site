@@ -304,11 +304,12 @@ def summarize(report: dict) -> dict:
         "scores": report["scores"],
         "tech": sorted(t["name"] for ts in report["technologies"]["by_category"].values() for t in ts),
         "vitals": {k: v.get(k) for k in ("lcp", "fcp", "cls", "tbt", "ttfb")} if v else None,
-        "page_bytes": perf["total_known_bytes"],
+        "page_bytes": (perf.get("vitals") or {}).get("transfer_bytes") or perf["total_known_bytes"],
         "requests": perf.get("browser_request_count") or perf["request_count"],
         "issue_count": len(perf["issues"]) + len(report["seo"]["issues"]) + len(report["accessibility"]["issues"]),
         "analysis_ms": report["analysis_ms"],
         "rendered": bool(report.get("browser", {}).get("available")),
+        "mode": analysis_mode(report),
     }
 
 
@@ -496,13 +497,25 @@ def delete_osint_target(target: str):
         c.execute("DELETE FROM osint_results WHERE target = ?", (target,))
 
 
-def previous_analysis(site_id: int, before_id: int, rendered: bool | None = None) -> dict | None:
-    """The iteration before `before_id`. With `rendered`, only one made the same way (with or
-    without the browser), since the two modes detect different technology and score differently."""
+def analysis_mode(report: dict) -> str:
+    """How an analysis was measured. Runs are only compared with runs of the same mode, since a
+    browser-free run detects less technology and throttled mobile vitals score lower than desktop ones."""
+    if not (report.get("browser") or {}).get("available"):
+        return "quick"
+    return "browser-mobile" if report["performance"].get("vitals_method") == "mobile-throttled" else "browser"
+
+
+# Older saved summaries have no "mode"; derive it the way analysis_mode() did before throttled runs existed.
+_MODE_SQL = ("COALESCE(json_extract(summary, '$.mode'), "
+             "CASE WHEN COALESCE(json_extract(summary, '$.rendered'), 0) THEN 'browser' ELSE 'quick' END)")
+
+
+def previous_analysis(site_id: int, before_id: int, mode: str | None = None) -> dict | None:
+    """The iteration before `before_id`; with `mode`, the last one measured the same way."""
     q, args = "SELECT id FROM analyses WHERE site_id = ? AND id < ?", [site_id, before_id]
-    if rendered is not None:
-        q += " AND COALESCE(json_extract(summary, '$.rendered'), 0) = ?"
-        args.append(1 if rendered else 0)
+    if mode is not None:
+        q += f" AND {_MODE_SQL} = ?"
+        args.append(mode)
     with db() as c:
         r = c.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
     return get_analysis(r["id"]) if r else None

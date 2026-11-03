@@ -10,7 +10,8 @@ let refreshTimer = null;
 
 const SCORE_KEYS = [["performance", "Perf"], ["seo", "SEO"], ["accessibility", "A11y"], ["security", "Sec"]];
 const steps = ["Fetching page", "Reading HTML", "Downloading stylesheets", "Measuring resources", "Checking TLS & headers",
-  "Checking robots.txt & sitemap", "Rendering in Chromium", "Measuring Core Web Vitals", "Taking screenshots", "Checking color contrast", "Loading the mobile view"];
+  "Checking robots.txt & sitemap", "Rendering in Chromium", "Taking screenshots", "Running axe-core accessibility checks",
+  "Measuring mobile performance on 4G", "Repeating mobile runs for a stable median", "Still measuring (heavy pages take longer)"];
 
 // ---------------------------------------------------------------- helpers
 
@@ -130,7 +131,9 @@ async function pageAnalyze(q, token) {
         ${["stripe.com", "github.com", "wordpress.org", "vercel.com"].map(u => `<button class="chip" type="button" data-url="${u}">${u}</button>`).join("")}
       </div>
       <div class="row" style="margin-top:12px;gap:18px">
-        <label class="toggle" style="margin:0"><input type="checkbox" id="render" checked> Load in a real browser (screenshots, Core Web Vitals, contrast)</label>
+        <label class="toggle" style="margin:0"><input type="checkbox" id="render" checked> Load in a real browser (screenshots, Core Web Vitals, axe-core)</label>
+        <label class="toggle" style="margin:0" title="Throttled mobile loads; the report shows the median">Mobile runs
+          <select class="field" id="runs" style="padding:4px 8px;font-size:13px"><option value="1">1 · fastest</option><option value="3" selected>3 · median</option><option value="5">5 · most stable</option></select></label>
         ${projects.length ? `<label class="toggle" style="margin:0">Save to project
           <select class="field" id="proj" style="padding:4px 8px;font-size:13px"><option value="">None</option>
           ${projects.map(p => `<option value="${p.id}" ${String(p.id) === preProject ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>` : ""}
@@ -159,6 +162,7 @@ async function runAnalysis(url) {
   url = url.trim(); if (!url || running) return;
   const useBrowser = $("#render")?.checked ?? true;
   const projectId = $("#proj")?.value || null;
+  const perfRuns = +($("#runs")?.value || 3);
   running = { url, step: steps[0] };
   $("#error").style.display = "none"; $("#report").innerHTML = "";
   showRunning(); refreshSidebar();
@@ -168,9 +172,9 @@ async function runAnalysis(url) {
   const tick = setInterval(() => {
     i = Math.min(i + 1, last); running.step = steps[i];
     if ($("#status-text")) $("#status-text").textContent = steps[i] + "…";
-  }, useBrowser ? 1800 : 1200);
+  }, useBrowser ? 1500 + perfRuns * 500 : 1200);   // more mobile runs take longer, so pace the messages
   try {
-    const res = await api("/api/analyze", { method: "POST", body: { url, render: useBrowser, project_id: projectId } });
+    const res = await api("/api/analyze", { method: "POST", body: { url, render: useBrowser, project_id: projectId, perf_runs: perfRuns } });
     lastResult = { ...res, requested: url };
     running = null;
     if ($("#report") && parseHash().parts[0] in { undefined: 1, analyze: 1 }) showResult(lastResult, true);
