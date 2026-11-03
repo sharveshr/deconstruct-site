@@ -2,7 +2,25 @@
 
 Paste a website URL and get a full report on how it's built.
 
-## Run it
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/sharveshr/deconstruct-site)
+
+## Run it in GitHub Codespaces
+
+Click the badge above (or **Code → Codespaces → Create codespace on main** on GitHub). The first start takes a few
+minutes while it installs the Python packages and Chromium; after that the server starts in a terminal on its own
+and the app opens in a new browser tab at `https://<codespace-name>-5173.app.github.dev`.
+
+- The forwarded URL is private to your GitHub account by default. To show it to someone else, open the **Ports** tab,
+  right-click port 5173 and set **Port Visibility** to Public. Anyone with the link can then run analyses.
+- The database lives in `data/` inside the codespace. It survives stopping and restarting the codespace but is lost
+  when the codespace is deleted.
+- Codespaces stop after 30 minutes without activity (configurable in your GitHub settings), and uptime monitoring and
+  scheduled watching only run while the codespace is running.
+- If the server isn't running (for example after you closed its terminal), start it with `python app.py`.
+- Notification links point at the codespace's forwarded URL automatically.
+- Free GitHub accounts include 120 core-hours (60 hours on the default 2-core machine) per month.
+
+## Run it locally
 
 ```
 py -m venv .venv
@@ -47,7 +65,8 @@ Email reads its SMTP settings from environment variables so no password is store
 SMTP_HOST=smtp.example.com SMTP_PORT=587 SMTP_USER=me@example.com SMTP_PASSWORD=… SMTP_FROM=alerts@example.com
 ```
 
-Set `APP_URL` to the address the app is reachable at so links in notifications work (default `http://localhost:$PORT`).
+Set `APP_URL` to the address the app is reachable at so links in notifications work (default `http://localhost:$PORT`,
+or the forwarded URL in a codespace).
 
 ### OSINT tools
 
