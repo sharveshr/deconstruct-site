@@ -19,7 +19,18 @@ import requests
 import store
 
 log = logging.getLogger("notify")
-APP_URL = os.environ.get("APP_URL", f"http://localhost:{os.environ.get('PORT', 5173)}").rstrip("/")
+
+
+def _default_app_url():
+    port = os.environ.get("PORT", 5173)
+    if os.environ.get("CODESPACE_NAME"):
+        # GitHub Codespaces forwards ports to https://<codespace>-<port>.app.github.dev
+        domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
+        return f"https://{os.environ['CODESPACE_NAME']}-{port}.{domain}"
+    return f"http://localhost:{port}"
+
+
+APP_URL = os.environ.get("APP_URL", _default_app_url()).rstrip("/")
 ICON = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
 COLOR = {"info": 0x1F5EFF, "warning": 0xB26A00, "critical": 0xC62E2E}
 _session = requests.Session()
