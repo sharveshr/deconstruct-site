@@ -130,13 +130,20 @@ async function runOsintTool(tool, target) {
   try {
     const r = await api(`/api/osint/${tool}?target=${encodeURIComponent(target)}`);
     if (osintState.target !== target) return;
-    osintState.results[tool] = { state: "ok", data: r.data, ms: r.ms, ran_at: r.ran_at };
+    osintState.results[tool] = { state: "ok", data: r.data, ms: r.ms, ran_at: r.ran_at, events: r.events || [] };
   } catch (e) {
     if (osintState.target !== target) return;
     osintState.results[tool] = { state: "error", error: e.message, ran_at: new Date().toISOString() };
   }
   updateOsintCard(tool);
-  if (!Object.values(osintState.results).some(r => r.state === "loading")) refreshSidebar();
+  if (!Object.values(osintState.results).some(r => r.state === "loading")) {
+    refreshSidebar();
+    const changes = Object.values(osintState.results).flatMap(r => r.events || []);
+    if (changes.length) {
+      toast(`${changes.length} change${changes.length === 1 ? "" : "s"} since the last lookup · <a href="#/alerts" style="color:inherit;text-decoration:underline">See alerts</a>`, 7000);
+      Object.values(osintState.results).forEach(r => { r.events = []; });   // announce each change once
+    }
+  }
 }
 
 function updateOsintCard(tool) {

@@ -1,17 +1,19 @@
 """Deconstruct Site: paste a URL, get a full breakdown of how the site is built.
 
 Also keeps a library of analyzed sites: projects that group them, every
-analysis saved as an iteration, and an uptime log per site.
+analysis saved as an iteration, an uptime log per site, and change alerts
+raised when a newer result differs from the previous one.
 """
 import os
-import time
 from datetime import datetime, timezone
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
 import monitor
+import notify
 import osint
 import store
+import watch
 from analyzer import AnalysisError, analyze
 from compare import compare
 
@@ -60,12 +62,9 @@ def api_analyze():
         report = analyze(url, render=b.get("render", True) is not False)
     except AnalysisError as e:
         return fail(str(e), 422)
-    site = store.get_or_create_site(url, report["overview"]["title"] or None)
-    saved = store.save_analysis(site["id"], report, str(b.get("label", "")))
-    if b.get("project_id"):
-        store.add_site_to_project(int(b["project_id"]), site["id"])
+    saved = watch.save_analysis(url, report, label=str(b.get("label", "")), project_id=b.get("project_id"))
     return ok({"report": report, "analysis_id": saved["id"], "iteration": saved["iteration"],
-               "site": store.get_site(site["id"]), "created_at": saved["created_at"]})
+               "site": saved["site"], "created_at": saved["created_at"], "events": saved["events"]})
 
 
 @app.get("/api/analyses")
@@ -153,6 +152,20 @@ def api_project_add_site(pid):
     return ok(site, 201)
 
 
+@app.post("/api/projects/<int:pid>/watch")
+def api_project_watch(pid):
+    """Applies one watch schedule to every site in a project."""
+    p = need(store.get_project(pid), "That project doesn't exist.")
+    b = body()
+    try:
+        for s in p["sites"]:
+            store.update_site(s["id"], watch_analyze_hours=b.get("watch_analyze_hours"), watch_osint_hours=b.get("watch_osint_hours"),
+                              monitor_enabled=b.get("monitor_enabled"), monitor_interval_min=b.get("monitor_interval_min"))
+    except (ValueError, TypeError) as e:
+        return fail(str(e))
+    return ok({"sites": len(p["sites"])})
+
+
 @app.delete("/api/projects/<int:pid>/sites/<int:sid>")
 def api_project_remove_site(pid, sid):
     store.remove_site_from_project(pid, sid)
@@ -184,8 +197,12 @@ def api_site(sid):
 def api_site_update(sid):
     need(store.get_site(sid))
     b = body()
-    store.update_site(sid, monitor_enabled=b.get("monitor_enabled"), monitor_interval_min=b.get("monitor_interval_min"),
-                      title=b.get("title"))
+    try:
+        store.update_site(sid, monitor_enabled=b.get("monitor_enabled"), monitor_interval_min=b.get("monitor_interval_min"),
+                          title=b.get("title"), watch_analyze_hours=b.get("watch_analyze_hours"),
+                          watch_osint_hours=b.get("watch_osint_hours"))
+    except (ValueError, TypeError) as e:
+        return fail(str(e))
     return ok(store.get_site(sid))
 
 
@@ -270,19 +287,94 @@ def api_osint(tool):
         target = osint.normalize_target(request.args.get("target", ""))
     except osint.OsintError as e:
         return fail(str(e))
-    t0 = time.perf_counter()
-    try:
-        result = osint.run(tool, target)
-    except osint.OsintError as e:
-        store.save_osint(target, tool, False, {"error": str(e)}, round((time.perf_counter() - t0) * 1000))
-        return fail(str(e), 422)
-    except Exception as e:  # one failing source shouldn't look like a server crash
-        app.logger.exception("osint %s failed", tool)
-        msg = f"{tool} lookup failed: {type(e).__name__}: {str(e)[:200]}"
-        store.save_osint(target, tool, False, {"error": msg}, round((time.perf_counter() - t0) * 1000))
-        return fail(msg, 502)
-    store.save_osint(target, tool, True, {"data": result["data"]}, result["ms"])
-    return ok(result)
+    success, result = watch.run_osint(tool, target)
+    return ok(result) if success else fail(result["error"], result["status"])
+
+
+# ---------------------------------------------------------------- alerts
+
+@app.get("/api/events")
+def api_events():
+    a = request.args
+    severity = a.get("severity", "info")
+    if severity not in store.SEVERITY_RANK:
+        return fail("severity must be info, warning or critical.")
+    return ok(store.list_events(site_id=a.get("site_id", type=int), target=a.get("target"), min_severity=severity,
+                                unread_only=a.get("unread") == "1", kind=a.get("kind"), before_id=a.get("before", type=int),
+                                limit=min(500, a.get("limit", 100, type=int))))
+
+
+@app.get("/api/events/unread")
+def api_events_unread():
+    return ok(store.unread_counts())
+
+
+@app.post("/api/events/read")
+def api_events_read():
+    """Body: {"ids": [..]} or {"all": true}; "read": false marks them unread."""
+    b = body()
+    ids = None if b.get("all") else [int(i) for i in b.get("ids", [])]
+    store.mark_events_read(ids, read=b.get("read", True) is not False)
+    return ok(store.unread_counts())
+
+
+@app.post("/api/events/delete")
+def api_events_delete():
+    b = body()
+    store.delete_events(None if b.get("all") else [int(i) for i in b.get("ids", [])])
+    return ok()
+
+
+@app.get("/api/channels")
+def api_channels():
+    return ok({"channels": store.list_channels(), "email_configured": bool(os.environ.get("SMTP_HOST")), "app_url": notify.APP_URL})
+
+
+@app.post("/api/channels")
+def api_channel_create():
+    b = body()
+    kind, target = str(b.get("kind", "")), str(b.get("target", "")).strip()
+    severity = b.get("min_severity", "warning")
+    if severity not in store.SEVERITY_RANK:
+        return fail("min_severity must be info, warning or critical.")
+    err = notify.validate(kind, target)
+    if err:
+        return fail(err)
+    name = str(b.get("name") or "").strip() or {"webhook": "Webhook", "slack": "Slack", "discord": "Discord", "email": target}[kind]
+    return ok(store.create_channel(kind, name, target, severity), 201)
+
+
+@app.patch("/api/channels/<int:cid>")
+def api_channel_update(cid):
+    ch = need(store.get_channel(cid), "That channel doesn't exist.")
+    b = body()
+    if b.get("min_severity") is not None and b["min_severity"] not in store.SEVERITY_RANK:
+        return fail("min_severity must be info, warning or critical.")
+    if b.get("target") is not None:
+        err = notify.validate(ch["kind"], b["target"])
+        if err:
+            return fail(err)
+    store.update_channel(cid, name=b.get("name"), target=b.get("target"), min_severity=b.get("min_severity"), enabled=b.get("enabled"))
+    return ok(store.get_channel(cid))
+
+
+@app.delete("/api/channels/<int:cid>")
+def api_channel_delete(cid):
+    store.delete_channel(cid)
+    return ok()
+
+
+@app.post("/api/channels/<int:cid>/test")
+def api_channel_test(cid):
+    ch = need(store.get_channel(cid), "That channel doesn't exist.")
+    err = notify.send_one(ch, notify.test_event())
+    return fail(f"Sending failed: {err}", 502) if err else ok({"sent": True})
+
+
+@app.get("/api/watch")
+def api_watch():
+    """Every site with its watch schedule, for the alerts settings page."""
+    return ok({"sites": store.list_sites(), "tools": watch.WATCH_TOOLS, "hours": store.WATCH_HOURS})
 
 
 @app.get("/api/health")
@@ -294,4 +386,5 @@ store.init()
 
 if __name__ == "__main__":
     monitor.start()
+    watch.start()
     app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5173)), debug=False, threaded=True)

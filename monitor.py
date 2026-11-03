@@ -41,8 +41,19 @@ def check_url(url: str) -> dict:
 
 def check_site(site: dict, source="auto") -> dict:
     result = check_url(site["url"])
-    return store.record_check(site["id"], result["status"], http_status=result["http_status"],
-                              response_ms=result["response_ms"], error=result["error"], source=source)
+    if result["status"] == "down":
+        # Confirm before recording an outage, so one dropped request doesn't page anyone.
+        time.sleep(5)
+        retry = check_url(site["url"])
+        if retry["status"] == "up":
+            result = retry
+    previous = store.get_site(site["id"])["last_status"]
+    check = store.record_check(site["id"], result["status"], http_status=result["http_status"],
+                               response_ms=result["response_ms"], error=result["error"], source=source)
+    if previous != check["status"] and (previous is not None or check["status"] == "down"):
+        import watch  # imported here: watch imports analyzer/osint, which monitor doesn't otherwise need
+        watch.on_status_change(store.get_site(site["id"]) | {"last_change_at": site.get("last_change_at")}, previous, check)
+    return check
 
 
 def _loop():
