@@ -11,7 +11,21 @@ py -m venv .venv
 .venv\Scripts\python app.py
 ```
 
-Then open http://localhost:5173 (or `http://localhost:5173/?url=stripe.com` to analyze straight away).
+Then open http://localhost:5173 (or `http://localhost:5173/#/?url=stripe.com` to analyze straight away).
+Set the `PORT` environment variable to use a different port.
+
+## The sidebar
+
+| Page | What it does |
+|---|---|
+| Analyze | Run an analysis. Every run is saved automatically as a new **iteration** of that site, optionally straight into a project. |
+| Projects | Group sites together (a client's sites, competitors…). Add sites by URL, re-analyze them all at once, tick two to compare. |
+| Uptime | Every saved site, with optional scheduled monitoring (every 1 min to 24 h). Per site: current status, uptime % for 24h/7d/30d, status timeline, response-time chart, incidents, and a log where you can record outages by hand with a note. |
+| History | Every analysis you've ever run, grouped by day and searchable, so nothing gets lost. |
+| Compare | Two different sites, or two iterations of one site, side by side: a scoreboard of measured metrics (scores, Core Web Vitals, page weight, requests, contrast failures…) with the winner of each, plus tech, issues, security headers, colors and fonts that differ. |
+
+Data lives in `data/deconstruct.db` (SQLite, git-ignored). Set `DECONSTRUCT_DB` to store it elsewhere.
+A site counts as **up** when it answers with HTTP status below 400 within 15 seconds.
 
 ## What it reports
 
@@ -32,15 +46,30 @@ load of the page (can be switched off with the checkbox, or `"render": false` in
 
 ## API
 
-`POST /api/analyze` with `{"url": "example.com", "render": true}` returns the whole report as JSON.
+All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`.
+
+| Method & path | Purpose |
+|---|---|
+| `POST /api/analyze` `{url, render?, project_id?, label?}` | Analyze and save; returns the report plus `analysis_id`, `iteration`, `site` |
+| `GET /api/analyses[?site_id=]` · `GET/PATCH/DELETE /api/analyses/<id>` | History and saved reports (PATCH sets `label`) |
+| `GET /api/compare?a=<id>&b=<id>` | Diff of two saved analyses |
+| `GET/POST /api/projects` · `GET/PATCH/DELETE /api/projects/<id>` | Projects |
+| `POST /api/projects/<id>/sites` `{url \| site_id}` · `DELETE /api/projects/<id>/sites/<site_id>` | Project membership |
+| `GET /api/sites` · `GET/PATCH/DELETE /api/sites/<id>` | Sites; PATCH sets `monitor_enabled`, `monitor_interval_min` |
+| `GET /api/sites/<id>/checks?days=` · `POST /api/sites/<id>/checks` `{status, at?, note?}` | Uptime log; POST records a manual up/down event |
+| `POST /api/sites/<id>/check-now` · `DELETE /api/checks/<id>` | Run a check immediately; delete a logged event |
 
 ## Files
 
-- `app.py` — Flask server
+- `app.py` — Flask server and API routes
 - `analyzer.py` — fetching, every report section, scoring, and merging in browser results
 - `browser.py` — headless Chromium pass (vitals, screenshots, computed styles, contrast, JS globals)
 - `signatures.py` — HTML/header technology fingerprints; add a line to detect something new
-- `static/index.html` — the UI
+- `store.py` — SQLite storage for projects, sites, iterations and uptime checks
+- `monitor.py` — background thread that checks monitored sites on their interval
+- `compare.py` — diff between two saved reports
+- `static/index.html`, `app.js`, `app.css` — app shell, sidebar and library pages
+- `static/report.js`, `styles.css` — the report view
 
 ## Notes
 

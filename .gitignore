@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 .claude/
+data/
 *.json.tmp
 .DS_Store
