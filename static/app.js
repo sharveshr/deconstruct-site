@@ -97,6 +97,7 @@ async function route() {
     if (p0 === "history") return await pageHistory(q, token);
     if (p0 === "analyses" && p1) return await pageAnalysis(+p1, token);
     if (p0 === "compare") return await pageCompare(q, token);
+    if (p0 === "osint") return await pageOsint(q, token);
     view.innerHTML = errorBox("Page not found.");
   } catch (e) {
     if (token === navToken) view.innerHTML = errorBox(e.message);
@@ -183,7 +184,7 @@ async function runAnalysis(url) {
 async function showResult(res, scroll) {
   const root = $("#report");
   const projects = await api("/api/projects").catch(() => []);
-  const actions = `
+  const actions = `<a class="ghost" href="#/osint?target=${encodeURIComponent(res.site.host)}">OSINT</a>
     ${res.iteration > 1 ? `<a class="ghost" href="#/compare?a=prev:${res.analysis_id}&b=${res.analysis_id}">Compare with previous</a>` : ""}
     ${projects.length ? `<select class="ghost" data-act="addproj" aria-label="Add to project"><option value="">Add to project…</option>
       ${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>` : ""}`;
@@ -204,6 +205,7 @@ async function pageAnalysis(id, token) {
   if (!fresh(token)) return;
   view.innerHTML = `<div class="wrap"><div class="crumbs" style="padding-top:22px"><a href="#/history">History</a> / <a href="#/sites/${a.site_id}">${esc(a.host)}</a> / Iteration ${a.iteration}</div><div id="report"></div></div>`;
   const actions = `<a class="ghost" href="#/?url=${encodeURIComponent(a.url)}">Analyze again</a>
+    <a class="ghost" href="#/osint?target=${encodeURIComponent(a.host)}">OSINT</a>
     ${a.iteration > 1 ? `<a class="ghost" href="#/compare?a=prev:${a.id}&b=${a.id}">Compare with previous</a>` : ""}`;
   renderReport(a.report, $("#report"), { analysis_id: a.id, iteration: a.iteration, site_id: a.site_id, created_at: a.created_at, label: a.label, actions });
 }
@@ -363,6 +365,7 @@ async function pageSite(id, q, token) {
       <div class="row">
         ${otherProjects.length ? `<select class="field" id="addproj" style="padding:6px 8px;font-size:13px"><option value="">Add to project…</option>
           ${otherProjects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>` : ""}
+        <a class="btn" href="#/osint?target=${encodeURIComponent(s.host)}">OSINT</a>
         <a class="btn dark" href="#/?url=${encodeURIComponent(s.url)}">Analyze again</a>
         <button class="btn danger" id="del-site">Delete site</button></div></div>
     <nav class="subtabs">

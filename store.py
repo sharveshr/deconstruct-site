@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS checks (
   note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS checks_site ON checks(site_id, checked_at);
+CREATE TABLE IF NOT EXISTS osint_results (
+  id INTEGER PRIMARY KEY,
+  target TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  ran_at TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  ms INTEGER,
+  result BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS osint_target ON osint_results(target, tool, ran_at);
 """
 
 
@@ -395,3 +405,34 @@ def prune_checks(keep_days: int = 90):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with db() as c:
         c.execute("DELETE FROM checks WHERE source = 'auto' AND checked_at < ?", (cutoff,))
+
+
+# ---------------------------------------------------------------- OSINT results
+
+def save_osint(target: str, tool: str, ok: bool, payload: dict, ms: int | None):
+    with db() as c:
+        c.execute("INSERT INTO osint_results (target, tool, ran_at, ok, ms, result) VALUES (?, ?, ?, ?, ?, ?)",
+                  (target, tool, now_iso(), 1 if ok else 0, ms, gzip.compress(json.dumps(payload).encode())))
+
+
+def latest_osint(target: str) -> dict:
+    """Most recent result of each tool for a target."""
+    with db() as c:
+        rows = c.execute("""SELECT o.* FROM osint_results o JOIN (
+                              SELECT tool, MAX(id) AS id FROM osint_results WHERE target = ? GROUP BY tool) m ON m.id = o.id""",
+                         (target,)).fetchall()
+    return {r["tool"]: {"ok": bool(r["ok"]), "ran_at": r["ran_at"], "ms": r["ms"], **json.loads(gzip.decompress(r["result"]))}
+            for r in rows}
+
+
+def recent_osint_targets(limit: int = 30) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("""
+          SELECT target, MAX(ran_at) AS last_run, COUNT(DISTINCT tool) AS tools, COUNT(*) AS runs,
+                 SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failures
+          FROM osint_results GROUP BY target ORDER BY last_run DESC LIMIT ?""", (limit,)).fetchall()]
+
+
+def delete_osint_target(target: str):
+    with db() as c:
+        c.execute("DELETE FROM osint_results WHERE target = ?", (target,))

@@ -22,7 +22,30 @@ Set the `PORT` environment variable to use a different port.
 | Projects | Group sites together (a client's sites, competitors…). Add sites by URL, re-analyze them all at once, tick two to compare. |
 | Uptime | Every saved site, with optional scheduled monitoring (every 1 min to 24 h). Per site: current status, uptime % for 24h/7d/30d, status timeline, response-time chart, incidents, and a log where you can record outages by hand with a note. |
 | History | Every analysis you've ever run, grouped by day and searchable, so nothing gets lost. |
+| OSINT | Twelve passive lookups for a domain, run in parallel; each result card fills in as its source answers, and results are saved (see below). |
 | Compare | Two different sites, or two iterations of one site, side by side: a scoreboard of measured metrics (scores, Core Web Vitals, page weight, requests, contrast failures…) with the winner of each, plus tech, issues, security headers, colors and fonts that differ. |
+
+### OSINT tools
+
+All lookups are passive and use public sources only; nothing is scanned or brute-forced.
+
+| Tool | What it finds | Source |
+|---|---|---|
+| DNS Lookup | A, AAAA, CNAME, MX, NS, TXT, SOA, CAA, HTTPS records | DNS-over-HTTPS (Cloudflare, Google fallback) |
+| WHOIS / RDAP | Registrar, created/expiry dates, status, nameservers, DNSSEC, abuse contact | RDAP via rdap.org |
+| Subdomain Discovery | Names seen on public certificates, which still resolve, notable ones (dev, staging, admin…) | crt.sh, Cert Spotter fallback |
+| SSL Certificate | Issuer, validity, days left, SANs, fingerprint, cipher, TLS 1.0–1.3 support, recent certificates | TLS handshake + CT logs |
+| HTTP Header Analyzer | Security-header grade, HSTS, CSP breakdown, cookie flags, software disclosure, caching, CORS | HTTPS request |
+| Technology Detection | CMS, frameworks, hosting, analytics with evidence | Fingerprints (`signatures.py`) |
+| IP / ASN Lookup | IPs, reverse DNS, ASN and AS name, prefix, network owner and abuse contact | Team Cymru DNS + RDAP |
+| Website History | First/last capture, months captured per year, snapshot links | Internet Archive CDX API |
+| Robots.txt Analyzer | Rules per user agent, AI-crawler policy, notable disallowed paths, sitemaps | robots.txt |
+| Sitemap Analyzer | URL count, sections, lastmod range, sample URLs (follows sitemap indexes, gzip) | sitemap.xml |
+| Email Security | SPF (incl. 10-lookup limit), DMARC, DKIM on ~45 common selectors, MTA-STS, TLS-RPT, BIMI, grade | DNS |
+| Redirect Analyzer | Hop-by-hop chains for http/https × bare/www, canonical URL, downgrades, meta refresh | HTTP |
+
+`GET /api/osint/<tool>?target=example.com` runs one tool; `GET /api/osint/saved?target=` returns the latest saved result per tool;
+`GET /api/osint/recent` lists looked-up domains.
 
 Data lives in `data/deconstruct.db` (SQLite, git-ignored). Set `DECONSTRUCT_DB` to store it elsewhere.
 A site counts as **up** when it answers with HTTP status below 400 within 15 seconds.
@@ -68,6 +91,8 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 - `store.py` — SQLite storage for projects, sites, iterations and uptime checks
 - `monitor.py` — background thread that checks monitored sites on their interval
 - `compare.py` — diff between two saved reports
+- `osint.py` — the twelve OSINT tools
+- `static/osint.js` — the OSINT page
 - `static/index.html`, `app.js`, `app.css` — app shell, sidebar and library pages
 - `static/report.js`, `styles.css` — the report view
 

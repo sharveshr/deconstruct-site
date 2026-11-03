@@ -4,11 +4,13 @@ Also keeps a library of analyzed sites: projects that group them, every
 analysis saved as an iteration, and an uptime log per site.
 """
 import os
+import time
 from datetime import datetime, timezone
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
 import monitor
+import osint
 import store
 from analyzer import AnalysisError, analyze
 from compare import compare
@@ -231,6 +233,56 @@ def api_check_now(sid):
 def api_check_delete(cid):
     store.delete_check(cid)
     return ok()
+
+
+# ---------------------------------------------------------------- OSINT
+
+@app.get("/api/osint/tools")
+def api_osint_tools():
+    return ok(list(osint.TOOLS))
+
+
+@app.get("/api/osint/recent")
+def api_osint_recent():
+    return ok(store.recent_osint_targets())
+
+
+@app.get("/api/osint/saved")
+def api_osint_saved():
+    try:
+        target = osint.normalize_target(request.args.get("target", ""))
+    except osint.OsintError as e:
+        return fail(str(e))
+    return ok({"target": target, "results": store.latest_osint(target)})
+
+
+@app.delete("/api/osint/saved")
+def api_osint_forget():
+    store.delete_osint_target(request.args.get("target", ""))
+    return ok()
+
+
+@app.get("/api/osint/<tool>")
+def api_osint(tool):
+    if tool not in osint.TOOLS:
+        return fail(f"Unknown tool: {tool}", 404)
+    try:
+        target = osint.normalize_target(request.args.get("target", ""))
+    except osint.OsintError as e:
+        return fail(str(e))
+    t0 = time.perf_counter()
+    try:
+        result = osint.run(tool, target)
+    except osint.OsintError as e:
+        store.save_osint(target, tool, False, {"error": str(e)}, round((time.perf_counter() - t0) * 1000))
+        return fail(str(e), 422)
+    except Exception as e:  # one failing source shouldn't look like a server crash
+        app.logger.exception("osint %s failed", tool)
+        msg = f"{tool} lookup failed: {type(e).__name__}: {str(e)[:200]}"
+        store.save_osint(target, tool, False, {"error": msg}, round((time.perf_counter() - t0) * 1000))
+        return fail(msg, 502)
+    store.save_osint(target, tool, True, {"data": result["data"]}, result["ms"])
+    return ok(result)
 
 
 @app.get("/api/health")

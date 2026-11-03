@@ -142,3 +142,30 @@
   .vs, .pick { grid-template-columns: 1fr; }
   .page-head { padding-top: 20px; }
 }
+
+/* ---------- OSINT ---------- */
+.osint-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); gap: 12px; align-items: start; }
+.osint-card { padding: 0; overflow: hidden; scroll-margin-top: 16px; }
+.osint-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.osint-head h2 { margin: 0; font-size: 15.5px; letter-spacing: -.01em; }
+.osint-head .ico { width: 20px; height: 20px; color: var(--ink-2); }
+.osint-body { padding: 14px 16px 16px; min-width: 0; }
+.osint-body .stat { padding: 10px 12px; }
+.osint-body .stat .v { font-size: 19px; }
+.osint-intro .ico { width: 20px; height: 20px; }
+.osint-chip { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+.osint-chip:hover { text-decoration: none; }
+.grade { display: inline-grid; place-items: center; width: 46px; height: 46px; border-radius: 10px; font-size: 24px; font-weight: 800; flex: none; background: var(--panel-2); }
+.grade-A { background: var(--good-bg); color: var(--good); }
+.grade-B { background: var(--good-bg); color: var(--good); }
+.grade-C { background: var(--warn-bg); color: var(--warn); }
+.grade-D, .grade-F { background: var(--bad-bg); color: var(--bad); }
+.year-bars { display: flex; gap: 3px; align-items: flex-end; height: 90px; padding-bottom: 16px; position: relative; }
+.year-bars .yb { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; position: relative; min-width: 6px; }
+.year-bars .yb i { display: block; width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; }
+.year-bars .yb span { position: absolute; bottom: -16px; font-size: 9.5px; color: var(--ink-3); }
+.ip-block { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.ip-block dl.kv { margin-top: 8px; font-size: 13.5px; }
+.chain { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
+.chain-start { display: flex; justify-content: space-between; gap: 10px; font-weight: 600; font-size: 13px; margin-bottom: 4px; flex-wrap: wrap; }
+.hop { display: flex; gap: 8px; align-items: baseline; padding: 4px 0 4px 10px; border-left: 2px solid var(--line); margin-left: 4px; flex-wrap: wrap; }
