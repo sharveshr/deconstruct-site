@@ -15,6 +15,7 @@ function eventHref(e) {
   if (l.compare) return `#/compare?a=${l.compare[0]}&b=${l.compare[1]}`;
   if (l.analysis) return `#/analyses/${l.analysis}`;
   if (l.uptime) return `#/sites/${l.uptime}?tab=uptime`;
+  if (l.crawl) return `#/crawls/${l.crawl}`;
   if (l.osint) return `#/osint?target=${encodeURIComponent(l.osint)}`;
   if (l.site) return `#/sites/${l.site}`;
   return null;
@@ -189,7 +190,7 @@ async function alertsWatching(token) {
         <td>${sel("watch_analyze_hours", s.watch_analyze_hours, s.id)}</td><td>${sel("watch_osint_hours", s.watch_osint_hours, s.id)}</td>
         <td><label class="toggle" style="margin:0"><input type="checkbox" data-mon="${s.id}" ${s.monitor_enabled ? "checked" : ""}> every ${s.monitor_interval_min} min</label></td>
         <td class="muted" style="font-size:12.5px">${s.last_watch_analysis_at ? `Analysis ${esc(ago(s.last_watch_analysis_at))}` : ""}${s.last_watch_analysis_at && s.last_watch_osint_at ? "<br>" : ""}${s.last_watch_osint_at ? `OSINT ${esc(ago(s.last_watch_osint_at))}` : ""}${!s.last_watch_analysis_at && !s.last_watch_osint_at ? "—" : ""}</td></tr>`).join("")}
-      </tbody></table></div>` : `<div class="empty"><h3>No sites yet</h3><p>Analyze a website first, then choose how often to watch it here.</p><a class="btn dark" href="#/">Analyze a website</a></div>`}`;
+      </tbody></table></div>` : `<div class="empty"><h3>No sites yet</h3><p>Analyze a website first, then choose how often to watch it here.</p><a class="btn dark" href="#/analyze">Analyze a website</a></div>`}`;
   view.querySelectorAll("[data-watch]").forEach(s => s.addEventListener("change", async () => {
     await api(`/api/sites/${s.dataset.sid}`, { method: "PATCH", body: { [s.dataset.watch]: +s.value } });
     toast(+s.value ? `Scheduled: ${HOURS_LABEL(+s.value).toLowerCase()}. First run within a minute.` : "Schedule off");

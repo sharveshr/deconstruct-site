@@ -1,4 +1,4 @@
-// OSINT page: twelve passive lookups for one domain. Each tool runs as its own
+// OSINT page: passive lookups for one domain. Each tool runs as its own
 // request so cards fill in as their sources answer. Results are saved server-side.
 
 const OSINT_TOOLS = [
@@ -14,6 +14,9 @@ const OSINT_TOOLS = [
   ["sitemap", "Sitemap Analyzer", "Publicly listed URLs", "sitemap.xml"],
   ["email", "Email Security", "SPF, DKIM, DMARC, MTA-STS and BIMI", "DNS"],
   ["redirects", "Redirect Analyzer", "Redirect chains for http/https and www", "HTTP"],
+  ["takeover", "Subdomain Takeover", "Subdomains pointing at services where the resource is gone", "CT + DNS + HTTP"],
+  ["lookalikes", "Lookalike Domains", "Registered typo, homoglyph and other-TLD domains", "DNS"],
+  ["reputation", "Blocklist Reputation", "Spamhaus, Google Safe Browsing and URLhaus listings", "Blocklists"],
 ];
 const OSINT_ICONS = {
   dns: '<path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1"/><circle cx="8" cy="12" r="1"/><circle cx="8" cy="18" r="1"/>',
@@ -28,6 +31,9 @@ const OSINT_ICONS = {
   sitemap: '<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>',
   email: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
   redirects: '<path d="M4 12h12M12 6l6 6-6 6"/><path d="M4 6v12"/>',
+  takeover: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="M12 8v5M12 16h.01"/>',
+  lookalikes: '<circle cx="8" cy="12" r="4"/><circle cx="16" cy="12" r="4"/><path d="M12 12h0"/>',
+  reputation: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
 };
 
 const osintState = { target: null, results: {} };
@@ -44,7 +50,7 @@ async function pageOsint(q, token) {
     <form class="search" id="osint-form" style="max-width:none">
       <label for="osint-target" style="position:absolute;left:-9999px">Domain</label>
       <input id="osint-target" name="target" placeholder="example.com" value="${esc(target)}" autocomplete="off" required>
-      <button class="primary" type="submit">Run all 12 tools →</button>
+      <button class="primary" type="submit">Run all ${OSINT_TOOLS.length} tools →</button>
     </form>
     <div id="osint-body" style="margin-top:18px"></div>
   </div>`;
@@ -61,7 +67,7 @@ async function pageOsint(q, token) {
       <div class="data-table"><table><thead><tr><th>Domain</th><th>Last run</th><th>Tools</th><th></th></tr></thead><tbody>
       ${recent.map(r => `<tr class="click" data-href="#/osint?target=${encodeURIComponent(r.target)}">
         <td><b>${esc(r.target)}</b></td><td>${esc(fmtTime(r.last_run))} <span class="muted">· ${esc(ago(r.last_run))}</span></td>
-        <td>${r.tools}/12${r.failures ? ` <span class="muted">· ${r.failures} failed run${r.failures === 1 ? "" : "s"}</span>` : ""}</td>
+        <td>${r.tools}/${OSINT_TOOLS.length}${r.failures ? ` <span class="muted">· ${r.failures} failed run${r.failures === 1 ? "" : "s"}</span>` : ""}</td>
         <td><button class="btn sm danger" data-forget="${esc(r.target)}">Forget</button></td></tr>`).join("")}</tbody></table></div>`
       : `<div class="grid">${OSINT_TOOLS.map(([id, name, what, src]) => `<div class="card osint-intro"><div class="row" style="gap:10px;margin-bottom:6px">
           <svg class="ico" viewBox="0 0 24 24">${OSINT_ICONS[id]}</svg><b>${esc(name)}</b></div>
@@ -103,7 +109,7 @@ function renderOsintShell(target) {
     <div class="row" style="justify-content:space-between;margin-bottom:14px">
       <div class="muted" id="osint-progress" style="font-size:13.5px"></div>
       <div class="row"><button class="btn" id="osint-rerun">${anySaved ? "Run again" : "Re-run all"}</button>
-        <a class="btn" href="#/?url=${encodeURIComponent(target)}">Full site analysis</a>
+        <a class="btn" href="#/analyze?url=${encodeURIComponent(target)}">Full site analysis</a>
         <button class="btn" id="osint-dl">Download JSON</button></div>
     </div>
     <div class="osint-grid">${OSINT_TOOLS.map(([id]) => `<section class="card osint-card" id="osint-${id}"></section>`).join("")}</div>`;
@@ -157,8 +163,8 @@ function updateOsintCard(tool) {
     const done = all.filter(x => x && x.state !== "loading").length, failed = all.filter(x => x?.state === "error").length;
     const loadingN = all.filter(x => x?.state === "loading").length;
     const savedAt = all.filter(x => x?.saved).map(x => x.ran_at).sort().at(-1);
-    prog.innerHTML = loadingN ? `<span class="row" style="gap:8px"><span class="spinner" style="width:13px;height:13px"></span>${done} of 12 done…</span>`
-      : `${done} of 12 tools${failed ? ` · <span style="color:var(--bad)">${failed} failed</span>` : ""}${savedAt ? ` · saved results from ${esc(fmtTime(savedAt))} (${esc(ago(savedAt))})` : ""}`;
+    prog.innerHTML = loadingN ? `<span class="row" style="gap:8px"><span class="spinner" style="width:13px;height:13px"></span>${done} of ${OSINT_TOOLS.length} done…</span>`
+      : `${done} of ${OSINT_TOOLS.length} tools${failed ? ` · <span style="color:var(--bad)">${failed} failed</span>` : ""}${savedAt ? ` · saved results from ${esc(fmtTime(savedAt))} (${esc(ago(savedAt))})` : ""}`;
   }
   if (!el) return;
   const [, name, what, src] = OSINT_TOOLS.find(t => t[0] === tool);
@@ -355,5 +361,39 @@ const OSINT_RENDER = {
         ${c.hops.map(h => `<div class="hop">${httpPill(h.status)} <span class="url mono" style="font-size:12px;overflow-wrap:anywhere">${esc(h.url)}</span>
           <span class="muted" style="font-size:11.5px;white-space:nowrap">${h.ms} ms${h.hsts ? " · HSTS" : ""}${h.meta_refresh ? ` · meta refresh → ${esc(h.meta_refresh)}` : ""}</span></div>`).join("")}
         ${c.error ? `<div class="hop"><span class="pill bad">error</span> <span>${esc(c.error)}</span></div>` : ""}</div>`).join("")}`;
+  },
+
+  takeover(d) {
+    const verdictPill = f => f.verdict === "vulnerable" ? '<span class="pill bad">likely takeover</span>' : '<span class="pill warn">dangling CNAME</span>';
+    return `${statPills([[d.subdomains_known.toLocaleString(), "names on certificates"], [d.checked, "checked"], [d.with_cname, "with a CNAME"], [d.findings.length, "candidates"]])}
+      ${d.findings.length ? d.findings.map(f => `<div class="issue"><span class="dot ${f.verdict === "vulnerable" ? "" : ""}"></span><div style="min-width:0">
+          <b class="mono">${esc(f.name)}</b> ${verdictPill(f)}${f.service ? ` <span class="pill">${esc(f.service)}</span>` : ""}
+          <div class="mono muted" style="font-size:12px;overflow-wrap:anywhere">CNAME → ${f.cname.map(esc).join(" → ")}</div>
+          <div style="font-size:13px">${esc(f.evidence)}</div></div></div>`).join("")
+        : okList([], ["No subdomain points at a missing resource on a known service."])}
+      ${d.services.length ? `${sub("Services the subdomains point at")}${d.services.map(([s, n]) => `<span class="pill">${esc(s)} · ${n}</span>`).join(" ")}` : ""}
+      <p class="muted" style="font-size:12px;margin:10px 0 0">${esc(d.note)} Names from ${esc(d.source)}.</p>`;
+  },
+
+  lookalikes(d) {
+    const riskPill = r => `<span class="pill ${r === "high" ? "bad" : r === "medium" ? "warn" : ""}">${r}</span>`;
+    return `${statPills([[d.checked, "variations checked"], [d.registered_count, "registered"], [d.with_mail, "receive mail"], [d.probably_yours, "on your nameservers"]])}
+      ${d.registered.length ? `${filterBox("lk", "Filter domains…")}<div class="table-scroll" style="max-height:420px"><table><thead><tr><th>Domain</th><th>Risk</th><th>Type</th><th>Mail</th><th>Web</th></tr></thead>
+        <tbody data-rows="lk">${d.registered.map(r => `<tr data-k="${esc(r.domain)}"><td class="mono">${esc(r.domain)}${r.same_nameservers ? ' <span class="pill good">probably yours</span>' : ""}</td>
+          <td>${riskPill(r.risk)}</td><td><span class="pill">${esc(r.fuzzer)}</span></td>
+          <td class="mono" style="font-size:12px">${r.mx.map(esc).join("<br>") || '<span class="muted">—</span>'}</td>
+          <td class="mono" style="font-size:12px">${r.a.map(esc).join("<br>") || '<span class="muted">—</span>'}</td></tr>`).join("")}</tbody></table></div>`
+        : okList([], ["None of the variations are registered."])}
+      <p class="muted" style="font-size:12px;margin:10px 0 0">${esc(d.note)} ${d.generated > d.checked ? `Checked the first ${d.checked} of ${d.generated} variations.` : ""}</p>`;
+  },
+
+  reputation(d) {
+    const st = c => c.status === "listed" ? '<span class="pill bad">Listed</span>' : c.status === "clean" ? '<span class="pill good">Not listed</span>'
+      : c.status === "history" ? '<span class="pill warn">Past reports</span>' : c.status === "not_configured" ? '<span class="pill">Not set up</span>' : '<span class="pill warn">No answer</span>';
+    return `<p style="margin:0 0 10px"><b>${esc(d.summary)}</b></p>
+      ${d.checks.map(c => `<div class="issue"><span class="dot ${c.status === "clean" ? "good" : ""}"></span><div style="min-width:0">
+        <b>${esc(c.source)}</b> ${st(c)}<div class="muted" style="font-size:13px">${esc(c.detail || "")}</div>
+        ${(c.listings || []).map(l => `<div style="font-size:13px"><span class="pill">${esc(l.list)}</span> <span class="mono">${esc(l.item)}</span> — ${esc(l.meaning)}</div>`).join("")}</div></div>`).join("")}
+      <p class="muted" style="font-size:12px;margin:10px 0 0">Web server addresses checked: ${d.ips.map(esc).join(", ") || "none"}.</p>`;
   },
 };

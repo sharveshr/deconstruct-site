@@ -27,7 +27,8 @@ from compare import compare
 log = logging.getLogger("watch")
 
 # OSINT tools refreshed on a schedule: the ones whose changes are worth an alert.
-WATCH_TOOLS = ["dns", "rdap", "ssl", "subdomains", "headers", "email", "redirects", "robots", "tech"]
+WATCH_TOOLS = ["dns", "rdap", "ssl", "subdomains", "headers", "email", "redirects", "robots", "tech",
+               "takeover", "lookalikes", "reputation"]
 SCORE_LABELS = {"performance": "Performance", "seo": "SEO", "accessibility": "Accessibility", "security": "Security"}
 DMARC_STRENGTH = {None: 0, "none": 1, "quarantine": 2, "reject": 3}
 NOTABLE_SUB = re.compile(r"(^|[.-])(dev|staging|stage|test|qa|uat|admin|internal|vpn|jenkins|git|grafana|kibana|old|beta)([.-]|$)")
@@ -110,6 +111,14 @@ def detect_analysis(site: dict, analysis_id: int, report: dict) -> list[dict]:
     elif tls.get("valid") is False:
         ev.add("cert_invalid", "critical", f"TLS certificate for {host} doesn't validate", [tls.get("error") or ""],
                dedup_key=f"cert-invalid:{host}:{_today()}", dedup_days=1)
+    # Once per library version per site, so a library that stays outdated doesn't alert on every run.
+    for f in ((report.get("security") or {}).get("vulnerable_libraries") or {}).get("findings", []):
+        fix = f"Upgrade to {f['upgrade_to']} or later." if f.get("upgrade_to") else "No fixed release in this line: move to a supported version."
+        ev.add("vulnerable_library", "critical" if f["severity"] in ("high", "critical") else "warning",
+               f"{host} loads {f['component']} {f['version']} with {len(f['vulnerabilities'])} known "
+               f"vulnerabilit{'y' if len(f['vulnerabilities']) == 1 else 'ies'}",
+               [v["summary"] + (f" ({', '.join(v['cve'][:2])})" if v["cve"] else "") for v in f["vulnerabilities"][:5]] + [fix],
+               dedup_key=f"vuln:{site['id']}:{f['component']}:{f['version']}")
     if not prev:
         return ev.flush()
 
@@ -273,6 +282,36 @@ def detect_osint(target: str, tool: str, run_id: int, data: dict) -> list[dict]:
         if prev.get("exists") and not data.get("exists"):
             ev.add("robots_missing", "warning", f"robots.txt on {target} disappeared", data.get("issues", []))
 
+    elif tool == "takeover":
+        # Every candidate is worth knowing about once; re-alerting each run would just be noise.
+        for f in data.get("findings", []):
+            ev.add("subdomain_takeover", "critical" if f["verdict"] == "vulnerable" else "warning",
+                   f"{f['name']} {'can likely be taken over' if f['verdict'] == 'vulnerable' else 'has a dangling CNAME'}"
+                   + (f" ({f['service']})" if f.get("service") else ""),
+                   [f"CNAME → {' → '.join(f['cname'])}", f["evidence"],
+                    "Delete the DNS record, or re-create the resource it points to."],
+                   dedup_key=f"takeover:{f['name']}:{f['cname'][-1]}")
+
+    elif tool == "lookalikes" and prev:
+        before = {r["domain"] for r in prev.get("registered", [])}
+        new = [r for r in data.get("registered", []) if r["domain"] not in before and not r["same_nameservers"]]
+        if new:
+            mail = [r for r in new if r["mx"]]
+            ev.add("lookalike_registered", "warning" if mail else "info",
+                   f"{len(new)} new lookalike domain{'s' if len(new) > 1 else ''} of {data['domain']} registered",
+                   [f"{r['domain']} ({r['fuzzer']}){' · receives mail' if r['mx'] else ''}{' · has a website address' if r['a'] else ''}"
+                    for r in new[:12]] + ([f"…and {len(new) - 12} more"] if len(new) > 12 else []),
+                   domains=[r["domain"] for r in new][:100])
+
+    elif tool == "reputation":
+        for c in data.get("checks", []):
+            if c["status"] == "listed":
+                ev.add("blocklisted", "critical", f"{data['domain']} is listed on {c['source']}",
+                       [f"{l['list']}: {l['item']} — {l['meaning']}" for l in c.get("listings", [])[:8]],
+                       dedup_key=f"blocklist:{data['domain']}:{c['source']}", dedup_days=7)
+        if prev and prev.get("listed") and not data.get("listed"):
+            ev.add("blocklist_cleared", "info", f"{data['domain']} is no longer on any checked blocklist")
+
     elif tool == "tech" and prev:
         names = lambda r: {t["name"]: t.get("version") for ts in r["by_category"].values() for t in ts}
         a, b = names(prev), names(data)
@@ -305,6 +344,43 @@ def run_osint(tool: str, target: str) -> tuple[bool, dict]:
     return True, result | {"events": events}
 
 
+# ---------------------------------------------------------------- crawls
+
+def detect_crawl(crawl: dict, summary: dict) -> list[dict]:
+    """Pages that started failing since the site's previous crawl, health drops and new noindex pages."""
+    host = crawl["host"]
+    ev = _Collector(site_id=crawl["site_id"], target=host, links={"crawl": crawl["id"]})
+    prev = store.previous_crawl(crawl["site_id"], crawl["id"]) if crawl.get("site_id") else None
+    broken = summary["broken_pages"]
+    if not prev:
+        if broken:
+            ev.add("crawl_broken", "warning", f"Crawl of {host} found {len(broken)} page{'s' if len(broken) > 1 else ''} returning errors",
+                   [f"{b['status'] or b['error']} · {b['url']}" for b in broken[:10]])
+        return ev.flush()
+    ps = prev["summary"] or {}
+    was_ok = {p["url"] for p in store.crawl_pages(prev["id"], with_data=False)
+              if p["state"] == "done" and p["status"] and p["status"] < 400}
+    newly = [b for b in broken if b["url"] in was_ok]
+    if newly:
+        root_down = any(b["url"] == crawl["root_url"] for b in newly)
+        ev.add("crawl_broken", "critical" if root_down or len(newly) >= 5 else "warning",
+               f"{len(newly)} page{'s' if len(newly) > 1 else ''} on {host} started returning errors",
+               [f"{b['status'] or b['error']} · {b['url']}" for b in newly[:12]] + ([f"…and {len(newly) - 12} more"] if len(newly) > 12 else []))
+    if ps.get("health") is not None and summary.get("health") is not None and summary["health"] <= ps["health"] - 10:
+        ev.add("crawl_health", "warning", f"Site health for {host} dropped {ps['health']} → {summary['health']}",
+               [f"{i['pages']} pages: {i['label']}" for i in summary["issues"][:6]])
+    before_noindex = {u for u, keys in (ps.get("page_issues") or {}).items() if "noindex" in keys}
+    now_noindex = [u for u, keys in summary["page_issues"].items() if "noindex" in keys and u not in before_noindex and u in was_ok]
+    if now_noindex:
+        ev.add("crawl_noindex", "warning", f"{len(now_noindex)} page{'s' if len(now_noindex) > 1 else ''} on {host} became noindex",
+               now_noindex[:12] + ["Search engines will drop these pages. Often a staging setting deployed by mistake."])
+    grew = summary["counts"]["broken_links"] - (ps.get("counts") or {}).get("broken_links", 0)
+    if grew >= 3:
+        ev.add("crawl_links", "info", f"{grew} more broken outgoing links on {host} than the last crawl",
+               [f"{b['status'] or b['error']} · {b['url']}" for b in summary["broken_links"][:8]])
+    return ev.flush()
+
+
 # ---------------------------------------------------------------- uptime
 
 def on_status_change(site: dict, previous: str | None, check: dict):
@@ -328,6 +404,11 @@ def on_status_change(site: dict, previous: str | None, check: dict):
 # ---------------------------------------------------------------- scheduler
 
 def _scheduled_analysis(site):
+    with store.as_user(site.get("user_id")):
+        _run_scheduled_analysis(site)
+
+
+def _run_scheduled_analysis(site):
     store.mark_watch_run(site["id"], "analyze")
     try:
         report = analyze(site["url"], render=True)
@@ -341,8 +422,12 @@ def _scheduled_analysis(site):
 
 def _scheduled_osint(site):
     store.mark_watch_run(site["id"], "osint")
+
+    def run_as_owner(tool):     # pool threads don't inherit the caller's current user
+        with store.as_user(site.get("user_id")):
+            return run_osint(tool, site["host"])
     with ThreadPoolExecutor(4) as pool:
-        list(pool.map(lambda t: run_osint(t, site["host"]), WATCH_TOOLS))
+        list(pool.map(run_as_owner, WATCH_TOOLS))
 
 
 def _loop():

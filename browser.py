@@ -8,6 +8,7 @@ run from a worker thread.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import statistics
 import time
@@ -427,7 +428,28 @@ def _median_vitals(runs: list[dict]) -> dict | None:
     return out
 
 
-def analyze_rendered(url: str, is_public, perf_runs: int = DEFAULT_PERF_RUNS) -> dict:
+def _runtime_versions(page, checks: dict[str, list[str]]) -> dict:
+    """Evaluates retire.js's version expressions (e.g. jQuery.fn.jquery) in the page. They run inline rather
+    than through eval so a page's CSP can't block them; a syntax error falls back to one library at a time."""
+    if not checks:
+        return {}
+    def script(items):
+        body = "".join(f"try{{const v=({e});if(typeof v==='string'&&/^[0-9]/.test(v)&&!o[{json.dumps(c)}])o[{json.dumps(c)}]=v}}catch(_){{}}"
+                       for c, exprs in items for e in exprs)
+        return f"(() => {{const o={{}};{body}return o}})()"
+    try:
+        return page.evaluate(script(checks.items()))
+    except PlaywrightError:
+        out = {}
+        for item in checks.items():
+            try:
+                out.update(page.evaluate(script([item])))
+            except PlaywrightError:
+                pass
+        return out
+
+
+def analyze_rendered(url: str, is_public, perf_runs: int = DEFAULT_PERF_RUNS, func_checks: dict | None = None) -> dict:
     if not AVAILABLE:
         return {"available": False, "error": "Playwright is not installed."}
     t0 = time.perf_counter()
@@ -460,6 +482,7 @@ def analyze_rendered(url: str, is_public, perf_runs: int = DEFAULT_PERF_RUNS) ->
                 globals_found = page.evaluate(COLLECT_GLOBALS)
                 styles = page.evaluate(COLLECT_STYLES)
                 contrast = page.evaluate(COLLECT_CONTRAST)
+                runtime_versions = _runtime_versions(page, func_checks or {})
                 components = {
                     "header": _element_shot(page, ["header", "[role=banner]", "nav"]),
                     "footer": _element_shot(page, ["footer", "[role=contentinfo]"]),
@@ -521,6 +544,8 @@ def analyze_rendered(url: str, is_public, perf_runs: int = DEFAULT_PERF_RUNS) ->
         "computed_styles": styles,
         "contrast": contrast,
         "js_technologies": globals_found,
+        "runtime_versions": runtime_versions,
+        "script_urls": list(dict.fromkeys(r["url"] for r in requests_seen if r["type"] == "script"))[:300],
         "console": console,
         "page_errors": page_errors,
         "failed_requests": [f for f in failed if "blockedbyclient" not in f["error"].lower()],

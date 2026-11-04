@@ -12,6 +12,7 @@ import base64
 import gzip
 import hashlib
 import ipaddress
+import os
 import re
 import socket
 import ssl
@@ -256,6 +257,7 @@ def _certspotter(domain: str):
     return r.json()
 
 
+@cached(600)   # the takeover check reuses it, and crt.sh is slow
 def subdomain_discovery(host: str) -> dict:
     domain = org_domain(host)
     names: dict[str, dict] = {}
@@ -1043,6 +1045,358 @@ def redirect_analysis(host: str) -> dict:
 
 # ---------------------------------------------------------------- registry
 
+# ---------------------------------------------------------------- subdomain takeover
+
+# (service, CNAME pattern, body fingerprint of an unclaimed resource or None, takeover possible when the CNAME target is NXDOMAIN)
+# Services whose takeovers are documented in the community "can-i-take-over-xyz" list.
+TAKEOVER_SERVICES = [
+    ("GitHub Pages", r"\.github\.io$", r"There isn't a GitHub Pages site here", False),
+    ("Heroku", r"\.(herokuapp|herokudns|herokussl)\.com$", r"No such app|herokucdn\.com/error-pages/no-such-app", True),
+    ("Amazon S3", r"\.s3[.-]([a-z0-9-]+\.)?amazonaws\.com$|\.s3-website[.-]", r"NoSuchBucket|The specified bucket does not exist", False),
+    ("Google Cloud Storage", r"c\.storage\.googleapis\.com$", r"NoSuchBucket", False),
+    ("Azure", r"\.(azurewebsites\.net|cloudapp\.net|cloudapp\.azure\.com|trafficmanager\.net|blob\.core\.windows\.net|azureedge\.net"
+              r"|azure-api\.net|azurecontainer\.io|azurefd\.net|azurestaticapps\.net|azurehdinsight\.net|servicebus\.windows\.net)$", None, True),
+    ("AWS Elastic Beanstalk", r"\.elasticbeanstalk\.com$", None, True),
+    ("Shopify", r"\.myshopify\.com$", r"Sorry, this shop is currently unavailable", False),
+    ("Fastly", r"\.fastly\.net$", r"Fastly error: unknown domain", False),
+    ("Ghost", r"\.ghost\.io$", r"The thing you were looking for is no longer here|Domain error", False),
+    ("Pantheon", r"\.pantheonsite\.io$", r"404 error unknown site", False),
+    ("Surge.sh", r"\.surge\.sh$", r"project not found", False),
+    ("Bitbucket", r"\.bitbucket\.io$", r"Repository not found", False),
+    ("Zendesk", r"\.zendesk\.com$", r"Help Center Closed", False),
+    ("Tumblr", r"domains\.tumblr\.com$", r"Whatever you were looking for doesn't currently exist at this address", False),
+    ("WordPress.com", r"\.wordpress\.com$", r"Do you want to register", False),
+    ("ReadMe", r"\.readme\.io$", r"Project doesnt exist\.\.\. yet!", False),
+    ("Help Scout", r"\.helpscoutdocs\.com$", r"No settings were found for this company", False),
+    ("Webflow", r"proxy(-ssl)?\.webflow\.com$", r"The page you are looking for doesn't exist or has been moved", False),
+    ("Unbounce", r"unbouncepages\.com$", r"The requested URL was not found on this server", False),
+    ("Agile CRM", r"agilecrm\.com$", r"Sorry, this page is no longer available", False),
+    ("Strikingly", r"s\.strikinglydns\.com$", r"But if you're looking to build your own website", False),
+    ("Ngrok", r"\.ngrok\.io$", r"Tunnel .{1,80} not found", False),
+]
+
+
+def _cname_chain(name: str) -> tuple[list[str], int | None]:
+    """CNAME targets for a name and the DNS status of the lookup (3 = the final target doesn't exist)."""
+    r = doh(name, "A")
+    return [a["data"] for a in r["answers"] if a["type"] == "CNAME"], r["status"]
+
+
+def takeover_check(host: str) -> dict:
+    """Subdomains whose CNAME points at a service where the resource is gone, so anyone could claim it.
+    Reads Certificate Transparency names, resolves them, and fetches the page only when the CNAME
+    points at a known service, to look for that service's 'nothing here' message."""
+    subs = subdomain_discovery(host)
+    domain = subs["domain"]
+    names = [n["name"] for n in subs["subdomains"][:250] if not n.get("wildcard")]
+
+    def check(name):
+        try:
+            chain, status = _cname_chain(name)
+        except OsintError:
+            return None
+        if not chain:
+            return None
+        target = chain[-1]
+        svc = next((s for s in TAKEOVER_SERVICES if any(re.search(s[1], c, re.I) for c in chain)), None)
+        row = {"name": name, "cname": chain, "service": svc[0] if svc else None, "nxdomain": status == 3}
+        if status == 3:
+            return row | {"verdict": "vulnerable" if svc and svc[3] else "dangling",
+                          "evidence": f"{target} doesn't exist (NXDOMAIN)."}
+        if svc and svc[2]:
+            try:
+                resp, body, _ = _fetch(name, max_bytes=300_000, timeout=8)
+                m = re.search(svc[2], body.decode("utf-8", "replace"), re.I)
+                if m:
+                    return row | {"verdict": "vulnerable",
+                                  "evidence": f"HTTP {resp.status_code} with {svc[0]}'s unclaimed-resource message: “{m.group(0)[:80]}”"}
+            except OsintError as e:
+                row["fetch_error"] = str(e)[:120]
+        return row | {"verdict": "ok"}
+
+    with ThreadPoolExecutor(16) as pool:
+        rows = [r for r in pool.map(check, names) if r]
+    findings = sorted((r for r in rows if r["verdict"] != "ok"), key=lambda r: (r["verdict"] != "vulnerable", r["name"]))
+    services = Counter(r["service"] for r in rows if r["service"])
+    return {"domain": domain, "source": subs["source"], "subdomains_known": subs["count"], "checked": len(names),
+            "with_cname": len(rows), "findings": findings, "services": services.most_common(),
+            "note": "Candidates need confirming by hand, and claim nothing you don't own. Fix one by deleting the DNS record or re-creating the resource."}
+
+
+# ---------------------------------------------------------------- lookalike domains
+
+_QWERTY = {
+    "1": "2q", "2": "3wq1", "3": "4ew2", "4": "5re3", "5": "6tr4", "6": "7yt5", "7": "8uy6", "8": "9iu7", "9": "0oi8", "0": "po9",
+    "q": "12wa", "w": "3esaq2", "e": "4rdsw3", "r": "5tfde4", "t": "6ygfr5", "y": "7uhgt6", "u": "8ijhy7", "i": "9okju8",
+    "o": "0plki9", "p": "lo0", "a": "qwsz", "s": "edxzaw", "d": "rfcxse", "f": "tgvcdr", "g": "yhbvft", "h": "ujnbgy",
+    "j": "ikmnhu", "k": "olmji", "l": "kop", "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn", "n": "bhjm", "m": "njk",
+}
+_GLYPHS = {"a": ["4"], "b": ["d", "lb"], "c": ["e"], "d": ["b", "cl"], "e": ["c", "3"], "g": ["q", "9"], "h": ["lh"],
+           "i": ["1", "l"], "k": ["lk", "ik"], "l": ["1", "i"], "m": ["n", "nn", "rn"], "n": ["m", "r"], "o": ["0"],
+           "q": ["g"], "s": ["5"], "u": ["v"], "v": ["u"], "w": ["vv"], "z": ["2"]}
+_GLYPH_PAIRS = {"rn": "m", "vv": "w", "cl": "d", "nn": "m"}
+_ALT_TLDS = ["com", "net", "org", "co", "io", "info", "biz", "app", "dev", "xyz", "online", "site", "shop", "store",
+             "us", "co.uk", "de", "in", "ai", "me", "cc", "top", "live", "support"]
+_AFFIXES = ["login", "secure", "account", "my", "support", "app", "mail", "online", "verify", "official", "help", "auth"]
+_LABEL_OK = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+MAX_LOOKALIKES = 500
+
+
+def _permutations(label: str, suffix: str) -> list[tuple[str, str]]:
+    """(fuzzer, domain) pairs in the spirit of dnstwist, most likely-to-matter fuzzers first."""
+    out: dict[str, str] = {}
+
+    def add(fuzzer, lab, suf=suffix):
+        lab = lab.strip("-")
+        if lab and _LABEL_OK.match(lab) and (lab, suf) != (label, suffix):
+            out.setdefault(f"{lab}.{suf}", fuzzer)
+
+    n = len(label)
+    for i, ch in enumerate(label):
+        for g in _GLYPHS.get(ch, []):
+            add("homoglyph", label[:i] + g + label[i + 1:])
+    for pair, g in _GLYPH_PAIRS.items():
+        for m in re.finditer(pair, label):
+            add("homoglyph", label[:m.start()] + g + label[m.end():])
+    for i in range(n):
+        add("omission", label[:i] + label[i + 1:])
+    for i in range(n - 1):
+        add("transposition", label[:i] + label[i + 1] + label[i] + label[i + 2:])
+    for i, ch in enumerate(label):
+        for k in _QWERTY.get(ch, ""):
+            add("replacement", label[:i] + k + label[i + 1:])
+    for t in _ALT_TLDS:
+        add("tld-swap", label, t)
+    for i, ch in enumerate(label):
+        add("repetition", label[:i] + ch + label[i:])
+    for i in range(1, n):
+        add("hyphenation", label[:i] + "-" + label[i:])
+    for i, ch in enumerate(label):
+        if ch in "aeiou":
+            for v in "aeiou":
+                add("vowel-swap", label[:i] + v + label[i + 1:])
+    for i, ch in enumerate(label):
+        for k in _QWERTY.get(ch, ""):
+            add("insertion", label[:i] + k + label[i:])
+            add("insertion", label[:i + 1] + k + label[i + 1:])
+    for a in _AFFIXES:
+        add("dictionary", f"{label}-{a}")
+        add("dictionary", f"{a}-{label}")
+        add("dictionary", f"{label}{a}")
+    for c in "abcdefghijklmnopqrstuvwxyz":
+        add("addition", label + c)
+    for i, ch in enumerate(label):
+        for bit in range(8):
+            flipped = chr(ord(ch) ^ (1 << bit))
+            if re.fullmatch(r"[a-z0-9-]", flipped):
+                add("bitsquatting", label[:i] + flipped + label[i + 1:])
+    add("www", "www" + label)
+    return [(f, d) for d, f in out.items()]
+
+
+def lookalike_domains(host: str) -> dict:
+    """Registered domains that look like this one (typos, homoglyphs, other TLDs), found with DNS only.
+    No lookalike site is visited."""
+    domain = org_domain(host)
+    label, _, suffix = domain.partition(".")
+    perms = _permutations(label, suffix)
+    checked = perms[:MAX_LOOKALIKES]
+    try:
+        own_ns = {x.lower() for x in records(domain, "NS")}
+    except OsintError:
+        own_ns = set()
+
+    def probe(item):
+        fuzzer, name = item
+        try:
+            r = doh(name, "NS")
+        except OsintError:
+            return None
+        ns = [a["data"].lower() for a in r["answers"] if a["type"] == "NS"]
+        if r["status"] != 0 or not ns:     # NXDOMAIN or no delegation: not registered (or not in use)
+            return None
+        try:
+            a, mx = records(name, "A"), records(name, "MX")
+        except OsintError:
+            a, mx = [], []
+        # "0 ." is a null MX (RFC 7505): the domain explicitly accepts no mail.
+        mx = [h for h in (m.split()[-1].rstrip(".") for m in mx) if h]
+        same_owner = bool(own_ns) and set(ns) == own_ns
+        risk = "low" if same_owner else "high" if mx else "medium" if a else "low"
+        return {"domain": name, "fuzzer": fuzzer, "ns": ns[:4], "a": a[:3], "mx": mx[:3],
+                "same_nameservers": same_owner, "risk": risk}
+
+    with ThreadPoolExecutor(24) as pool:
+        found = [r for r in pool.map(probe, checked) if r]
+    order = {"high": 0, "medium": 1, "low": 2}
+    found.sort(key=lambda r: (order[r["risk"]], r["domain"]))
+    return {"domain": domain, "generated": len(perms), "checked": len(checked), "registered": found,
+            "registered_count": len(found), "with_mail": sum(1 for r in found if r["mx"]),
+            "probably_yours": sum(1 for r in found if r["same_nameservers"]),
+            "fuzzers": Counter(f for f, _ in checked).most_common(),
+            "note": "Registered means the name has nameservers. A lookalike that receives mail (MX) can be used for phishing. "
+                    "Ones on your own nameservers are probably defensive registrations."}
+
+
+# ---------------------------------------------------------------- reputation / blocklists
+
+DBL_CODES = {"127.0.1.2": "spam domain", "127.0.1.4": "phishing domain", "127.0.1.5": "malware domain",
+             "127.0.1.6": "botnet command-and-control domain", "127.0.1.102": "abused legitimate spam domain",
+             "127.0.1.103": "abused legitimate redirector", "127.0.1.104": "abused legitimate phishing domain",
+             "127.0.1.105": "abused legitimate malware domain", "127.0.1.106": "abused legitimate botnet C&C domain"}
+ZEN_CODES = {"127.0.0.2": "SBL (spam source)", "127.0.0.3": "SBL CSS (snowshoe spam)", "127.0.0.4": "XBL (exploited or infected host)",
+             "127.0.0.5": "XBL (exploited or infected host)", "127.0.0.6": "XBL (exploited or infected host)",
+             "127.0.0.7": "XBL (exploited or infected host)", "127.0.0.9": "DROP (hijacked network)",
+             "127.0.0.10": "PBL (address not meant to send mail directly)", "127.0.0.11": "PBL (address not meant to send mail directly)"}
+SPAMHAUS_ERRORS = {"127.255.255.252": "the query was malformed",
+                   "127.255.255.254": "this server uses a public DNS resolver, which Spamhaus refuses",
+                   "127.255.255.255": "this server's DNS resolver has sent too many queries"}
+
+
+def _dns_udp(name: str, server: str, timeout=3.0) -> tuple[int, list[str]]:
+    """One A query sent straight to an authoritative server: (rcode, IPv4 answers). rcode 3 is NXDOMAIN."""
+    qid = int.from_bytes(os.urandom(2), "big")
+    # Recursion-desired must be set: Spamhaus's servers refuse queries without it, though they answer from their own zone.
+    q = qid.to_bytes(2, "big") + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    q += b"".join(bytes([len(p)]) + p.encode() for p in name.rstrip(".").split(".")) + b"\x00\x00\x01\x00\x01"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(q, (server, 53))
+        while True:
+            data, _ = sock.recvfrom(1500)
+            if data[:2] == qid.to_bytes(2, "big"):
+                break
+    rcode, ancount = data[3] & 0x0F, int.from_bytes(data[6:8], "big")
+    i = 12
+    while data[i]:                       # skip the question name
+        i += data[i] + 1
+    i += 5
+    ips = []
+    for _ in range(ancount):
+        if data[i] & 0xC0 == 0xC0:
+            i += 2
+        else:
+            while data[i]:
+                i += data[i] + 1
+            i += 1
+        rtype, rdlen = int.from_bytes(data[i:i + 2], "big"), int.from_bytes(data[i + 8:i + 10], "big")
+        i += 10
+        if rtype == 1 and rdlen == 4:
+            ips.append(".".join(str(b) for b in data[i:i + 4]))
+        i += rdlen
+    return rcode, ips
+
+
+@cached(3600)
+def _zone_servers(zone: str) -> list[str]:
+    ips = []
+    for ns in records(zone, "NS")[:4]:
+        try:
+            ips += records(ns, "A")[:1]
+        except OsintError:
+            pass
+    if not ips:
+        raise OsintError(f"Couldn't find the nameservers for {zone}.")
+    return ips
+
+
+def _blocklist_lookup(name: str, zone: str) -> list[str] | None:
+    """Answers for `name` from the blocklist zone's own nameservers; None when not listed. Spamhaus refuses
+    queries that arrive through big public resolvers, so they don't go through DNS-over-HTTPS."""
+    last = None
+    for server in _zone_servers(zone):
+        try:
+            rcode, ips = _dns_udp(name, server)
+        except (OSError, IndexError) as e:
+            last = e
+            continue
+        if rcode == 3:
+            return None
+        if rcode == 0:
+            return ips or None
+        last = f"DNS error code {rcode}"
+    raise OsintError(f"No answer from {zone}'s nameservers ({type(last).__name__ if isinstance(last, Exception) else last}).")
+
+
+def _spamhaus(domain: str, ips: list[str]) -> dict:
+    out = {"source": "Spamhaus", "listings": [], "status": "clean"}
+    try:
+        for code in _blocklist_lookup(f"{domain}.dbl.spamhaus.org", "dbl.spamhaus.org") or []:
+            if code in SPAMHAUS_ERRORS:
+                return out | {"status": "error", "detail": f"Spamhaus didn't answer: {SPAMHAUS_ERRORS[code]}."}
+            out["listings"].append({"list": "DBL", "item": domain, "meaning": DBL_CODES.get(code, code)})
+        for ip in ips[:4]:
+            if ":" in ip:
+                continue
+            for code in _blocklist_lookup(".".join(reversed(ip.split("."))) + ".zen.spamhaus.org", "zen.spamhaus.org") or []:
+                if code in SPAMHAUS_ERRORS:
+                    return out | {"status": "error", "detail": f"Spamhaus didn't answer: {SPAMHAUS_ERRORS[code]}."}
+                out["listings"].append({"list": "ZEN", "item": ip, "meaning": ZEN_CODES.get(code, code),
+                                        "policy_only": code in ("127.0.0.10", "127.0.0.11")})
+    except OsintError as e:
+        return out | {"status": "error", "detail": str(e)}
+    if any(not l.get("policy_only") for l in out["listings"]):
+        out["status"] = "listed"
+    return out | {"detail": "The domain against the Domain Block List, and its web server addresses against ZEN."}
+
+
+def _safe_browsing(host: str) -> dict:
+    key = os.environ.get("SAFE_BROWSING_API_KEY")
+    src = "Google Safe Browsing"
+    if not key:
+        return {"source": src, "status": "not_configured",
+                "detail": "Set SAFE_BROWSING_API_KEY (a free Google Cloud API key) to check Google's malware and phishing lists."}
+    body = {"client": {"clientId": "deconstruct-site", "clientVersion": "1.0"},
+            "threatInfo": {"threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                           "platformTypes": ["ANY_PLATFORM"], "threatEntryTypes": ["URL"],
+                           "threatEntries": [{"url": f"{s}://{host}/"} for s in ("http", "https")]}}
+    try:
+        r = _api.post("https://safebrowsing.googleapis.com/v4/threatMatches:find", params={"key": key}, json=body, timeout=10)
+    except requests.RequestException as e:
+        return {"source": src, "status": "error", "detail": f"Request failed ({type(e).__name__})."}
+    if r.status_code != 200:
+        return {"source": src, "status": "error", "detail": f"HTTP {r.status_code}: {r.text[:120]}"}
+    matches = r.json().get("matches", [])
+    return {"source": src, "status": "listed" if matches else "clean",
+            "listings": [{"list": m["threatType"].replace("_", " ").lower(), "item": m["threat"]["url"], "meaning": m["platformType"]} for m in matches],
+            "detail": "Google's lists of malware, phishing and unwanted-software sites."}
+
+
+def _urlhaus(host: str) -> dict:
+    key = os.environ.get("URLHAUS_AUTH_KEY")
+    src = "URLhaus (abuse.ch)"
+    if not key:
+        return {"source": src, "status": "not_configured",
+                "detail": "Set URLHAUS_AUTH_KEY (free from auth.abuse.ch) to check abuse.ch's list of malware download sites."}
+    try:
+        j = _api.post("https://urlhaus-api.abuse.ch/v1/host/", data={"host": host}, headers={"Auth-Key": key}, timeout=10).json()
+    except (requests.RequestException, ValueError) as e:
+        return {"source": src, "status": "error", "detail": f"Request failed ({type(e).__name__})."}
+    if j.get("query_status") == "no_results":
+        return {"source": src, "status": "clean", "detail": "No malware URLs reported on this host."}
+    if j.get("query_status") != "ok":
+        return {"source": src, "status": "error", "detail": str(j.get("query_status"))[:120]}
+    online = [u for u in j.get("urls", []) if u.get("url_status") == "online"]
+    return {"source": src, "status": "listed" if online else "history",
+            "listings": [{"list": "URLhaus", "item": u["url"], "meaning": f"{u.get('threat')} · {u.get('url_status')}"} for u in j.get("urls", [])[:15]],
+            "detail": f"{j.get('url_count', 0)} malware URLs reported, {len(online)} still online." if online
+                      else f"{j.get('url_count', 0)} malware URLs reported in the past, none online now."}
+
+
+def reputation(host: str) -> dict:
+    """Whether the domain or its web server addresses are on public blocklists."""
+    domain = org_domain(host)
+    try:
+        ips = records(host, "A")
+    except OsintError:
+        ips = []
+    with ThreadPoolExecutor(3) as pool:
+        checks = list(pool.map(lambda f: f(), [lambda: _spamhaus(domain, ips), lambda: _safe_browsing(host), lambda: _urlhaus(host)]))
+    listed = [c["source"] for c in checks if c["status"] == "listed"]
+    return {"domain": domain, "host": host, "ips": ips, "checks": checks, "listed": bool(listed), "listed_on": listed,
+            "summary": f"Listed on {', '.join(listed)}." if listed else "Not listed on any blocklist that answered."}
+
+
 TOOLS = {
     "dns": dns_lookup,
     "rdap": rdap_lookup,
@@ -1056,6 +1410,9 @@ TOOLS = {
     "sitemap": sitemap_analysis,
     "email": email_security,
     "redirects": redirect_analysis,
+    "takeover": takeover_check,
+    "lookalikes": lookalike_domains,
+    "reputation": reputation,
 }
 
 
