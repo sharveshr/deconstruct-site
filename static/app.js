@@ -1,12 +1,14 @@
-// App shell: hash router, sidebar, and the library pages
+// App shell: hash router, sidebar, accounts, and the library pages
 // (analyze, projects, uptime, history, saved reports, compare).
-// Report rendering itself lives in report.js.
+// Report rendering lives in report.js; home and sign-in pages in home.js; crawls in crawl.js.
 
 const view = $("#view");
 let navToken = 0;           // bumps on every navigation so slow fetches don't paint over a newer page
 let lastResult = null;      // most recent analysis, so returning to Analyze still shows it
 let running = null;         // { url } while an analysis is in flight
 let refreshTimer = null;
+let currentUser = null;     // the signed-in account, or null
+let authInfo = { signup_open: true, has_users: true };
 
 const SCORE_KEYS = [["performance", "Perf"], ["seo", "SEO"], ["accessibility", "A11y"], ["security", "Sec"]];
 const steps = ["Fetching page", "Reading HTML", "Downloading stylesheets", "Measuring resources", "Checking TLS & headers",
@@ -16,10 +18,32 @@ const steps = ["Fetching page", "Reading HTML", "Downloading stylesheets", "Meas
 // ---------------------------------------------------------------- helpers
 
 async function api(path, { method = "GET", body } = {}) {
-  const r = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  // The custom header is how the server tells this app's requests from a cross-site form post.
+  const headers = { "X-Requested-With": "fetch", ...(body ? { "Content-Type": "application/json" } : {}) };
+  const r = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({ ok: false, error: `Server error (HTTP ${r.status})` }));
+  if (r.status === 401 && j.auth) {           // session ended: back to sign-in, then here again
+    setUser(null);
+    const { parts } = parseHash();
+    if (!["signin", "signup", ""].includes(parts[0] || "")) location.hash = "#/signin?next=" + encodeURIComponent(location.hash.slice(1));
+    throw new Error("Sign in to continue.");
+  }
   if (!j.ok) throw new Error(j.error || "Request failed.");
   return j.data;
+}
+
+function setUser(user) {
+  currentUser = user;
+  document.body.classList.toggle("signed-out", !user);
+  const box = $("#side-user");
+  if (box) box.innerHTML = user ? `<div class="me"><span class="avatar" aria-hidden="true">${esc((user.name || user.email)[0].toUpperCase())}</span>
+      <div style="min-width:0"><div class="nm">${esc(user.name || user.email.split("@")[0])}</div><div class="em">${esc(user.email)}</div></div></div>
+      <button class="btn sm" id="signout">Sign out</button>` : "";
+  $("#signout")?.addEventListener("click", async () => {
+    await api("/api/auth/signout", { method: "POST" }).catch(() => {});
+    setUser(null); lastResult = null;
+    if (location.hash === "#/" || !location.hash) route(); else location.hash = "#/";
+  });
 }
 
 function toast(msg, ms = 2800) {
@@ -46,6 +70,7 @@ const parseHash = () => {
 // ---------------------------------------------------------------- sidebar
 
 async function refreshSidebar() {
+  if (!currentUser) return;
   try {
     const [projects, sites, unread] = await Promise.all([api("/api/projects"), api("/api/sites"), api("/api/events/unread")]);
     const alertCount = unread.critical + unread.warning, ab = $("#alerts-badge");
@@ -68,8 +93,8 @@ async function refreshSidebar() {
   } catch { /* sidebar is best-effort */ }
 }
 
-function setActiveNav(parts) {
-  const route = parts[0] === "analyses" ? "history" : parts[0] || "analyze";
+function setActiveNav(parts, q) {
+  const route = parts[0] === "analyses" ? "history" : parts[0] || (q?.get("url") ? "analyze" : "home");
   document.querySelectorAll(".nav a").forEach(a => a.classList.toggle("active", a.dataset.route === route));
   $("#sidebar").classList.remove("open");
   $("#menu-btn").setAttribute("aria-expanded", "false");
@@ -85,16 +110,25 @@ $("#menu-btn").addEventListener("click", () => {
 async function route() {
   if (location.search.includes("url=") && !location.hash) {   // old ?url= links
     const u = new URLSearchParams(location.search).get("url");
-    history.replaceState(null, "", "/#/?url=" + encodeURIComponent(u));
+    history.replaceState(null, "", "/#/analyze?url=" + encodeURIComponent(u));
   }
   const token = ++navToken;
   clearInterval(refreshTimer);
+  clearTimeout(crawlTimer);
   const { parts, q } = parseHash();
-  setActiveNav(parts);
-  refreshSidebar();
+  setActiveNav(parts, q);
   const [p0, p1] = parts;
+  if (p0 === "signin" || p0 === "signup") return pageAuth(p0, q);
+  if (!p0 && !q.get("url")) { refreshSidebar(); return pageHome(); }
+  if (!currentUser) {
+    location.replace("#/signin?next=" + encodeURIComponent(location.hash.slice(1) || "/analyze"));
+    return;
+  }
+  refreshSidebar();
   try {
     if (!p0 || p0 === "analyze") return pageAnalyze(q, token);
+    if (p0 === "crawls" && p1) return await pageCrawl(+p1, q, token);
+    if (p0 === "crawls") return await pageCrawls(q, token);
     if (p0 === "projects" && p1) return await pageProject(+p1, token);
     if (p0 === "projects") return await pageProjects(q, token);
     if (p0 === "sites" && p1) return await pageSite(+p1, q, token);
@@ -174,7 +208,7 @@ async function runAnalysis(url) {
   running = { url, step: steps[0] };
   $("#error").style.display = "none"; $("#report").innerHTML = "";
   showRunning(); refreshSidebar();
-  history.replaceState(null, "", "#/?url=" + encodeURIComponent(url));
+  history.replaceState(null, "", "#/analyze?url=" + encodeURIComponent(url));
   let i = 0;
   const last = useBrowser ? steps.length - 1 : 5;
   const tick = setInterval(() => {
@@ -228,7 +262,7 @@ async function pageAnalysis(id, token) {
   const a = await api(`/api/analyses/${id}`);
   if (!fresh(token)) return;
   view.innerHTML = `<div class="wrap"><div class="crumbs" style="padding-top:22px"><a href="#/history">History</a> / <a href="#/sites/${a.site_id}">${esc(a.host)}</a> / Iteration ${a.iteration}</div><div id="report"></div></div>`;
-  const actions = `<a class="ghost" href="#/?url=${encodeURIComponent(a.url)}">Analyze again</a>
+  const actions = `<a class="ghost" href="#/analyze?url=${encodeURIComponent(a.url)}">Analyze again</a>
     <a class="ghost" href="#/osint?target=${encodeURIComponent(a.host)}">OSINT</a>
     ${a.iteration > 1 ? `<a class="ghost" href="#/compare?a=prev:${a.id}&b=${a.id}">Compare with previous</a>` : ""}`;
   renderReport(a.report, $("#report"), { analysis_id: a.id, iteration: a.iteration, site_id: a.site_id, created_at: a.created_at, label: a.label, actions });
@@ -363,7 +397,7 @@ async function pageSites(token) {
         <td>${s.monitor_interval_min} min</td>
         <td><label class="toggle" style="margin:0" onclick="event.stopPropagation()"><input type="checkbox" data-mon="${s.id}" ${s.monitor_enabled ? "checked" : ""}> On</label></td>
         <td>${s.iterations}</td></tr>`).join("")}</tbody></table></div>`
-      : `<div class="empty"><h3>No websites yet</h3><p>Analyze a site and it shows up here.</p><a class="btn dark" href="#/">Analyze a website</a></div>`}
+      : `<div class="empty"><h3>No websites yet</h3><p>Analyze a site and it shows up here.</p><a class="btn dark" href="#/analyze">Analyze a website</a></div>`}
   </div>`;
   view.querySelectorAll("tr[data-href]").forEach(tr => tr.addEventListener("click", () => location.hash = tr.dataset.href));
   view.querySelectorAll("[data-mon]").forEach(cb => cb.addEventListener("change", async () => {
@@ -392,7 +426,7 @@ async function pageSite(id, q, token) {
         ${otherProjects.length ? `<select class="field" id="addproj" style="padding:6px 8px;font-size:13px"><option value="">Add to project…</option>
           ${otherProjects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>` : ""}
         <a class="btn" href="#/osint?target=${encodeURIComponent(s.host)}">OSINT</a>
-        <a class="btn dark" href="#/?url=${encodeURIComponent(s.url)}">Analyze again</a>
+        <a class="btn dark" href="#/analyze?url=${encodeURIComponent(s.url)}">Analyze again</a>
         <button class="btn danger" id="del-site">Delete site</button></div></div>
     <nav class="subtabs">
       <a href="#/sites/${id}?tab=iterations" class="${tab === "iterations" ? "on" : ""}">Iterations (${s.iterations.length})</a>
@@ -455,7 +489,7 @@ function scoreTrend(its) {
 
 function renderIterationsTab(s) {
   const its = s.iterations;
-  if (!its.length) return `<div class="empty"><h3>Not analyzed yet</h3><p>Run an analysis to start this site's history.</p><a class="btn dark" href="#/?url=${encodeURIComponent(s.url)}">Analyze now</a></div>`;
+  if (!its.length) return `<div class="empty"><h3>Not analyzed yet</h3><p>Run an analysis to start this site's history.</p><a class="btn dark" href="#/analyze?url=${encodeURIComponent(s.url)}">Analyze now</a></div>`;
   return `<div class="grid" style="margin-bottom:12px">${scoreTrend(its)}</div>
     <div class="row" style="margin-bottom:10px;justify-content:space-between"><span class="muted" style="font-size:13px">Pick two iterations (A and B) to compare them.</span>
       <button class="btn" id="cmp-its" disabled>Compare A → B</button></div>
@@ -598,9 +632,9 @@ async function pageHistory(q, token) {
           <div class="muted" style="font-size:12.5px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(i.title || i.final_url)}</div></td>
         <td>${miniScores(i.scores)}</td>
         <td class="muted" style="font-size:12.5px;white-space:nowrap">${i.tech.slice(0, 3).map(esc).join(", ")}${i.tech.length > 3 ? ` +${i.tech.length - 3}` : ""}</td>
-        <td style="white-space:nowrap"><a class="btn sm" href="#/?url=${encodeURIComponent(i.url)}" onclick="event.stopPropagation()">Re-analyze</a></td></tr>`).join("")}</tbody></table></div>`).join("")
+        <td style="white-space:nowrap"><a class="btn sm" href="#/analyze?url=${encodeURIComponent(i.url)}" onclick="event.stopPropagation()">Re-analyze</a></td></tr>`).join("")}</tbody></table></div>`).join("")
       : items.length ? `<div class="empty"><h3>No matches</h3><p>Nothing in your history matches "${esc(filter)}".</p></div>`
-      : `<div class="empty"><h3>Nothing analyzed yet</h3><p>Analyses are saved here automatically.</p><a class="btn dark" href="#/">Analyze a website</a></div>`}
+      : `<div class="empty"><h3>Nothing analyzed yet</h3><p>Analyses are saved here automatically.</p><a class="btn dark" href="#/analyze">Analyze a website</a></div>`}
   </div>`;
   view.querySelectorAll("tr[data-href]").forEach(tr => tr.addEventListener("click", () => location.hash = tr.dataset.href));
   const f = $("#hsearch");
@@ -666,7 +700,7 @@ async function pageCompare(q, token) {
   };
   view.innerHTML = `<div class="wrap">
     <div class="page-head"><div><h1>Compare</h1><p>Put two websites side by side, or two iterations of the same site, on measured numbers: scores, Core Web Vitals, weight, requests and more.</p></div></div>
-    ${all.length < 2 ? `<div class="empty"><h3>Analyze at least two websites first</h3><p>Every analysis is saved, so you can compare any two of them here.</p><a class="btn dark" href="#/">Analyze a website</a></div>` : `
+    ${all.length < 2 ? `<div class="empty"><h3>Analyze at least two websites first</h3><p>Every analysis is saved, so you can compare any two of them here.</p><a class="btn dark" href="#/analyze">Analyze a website</a></div>` : `
     <form class="pick" id="pick">${picker("a", a)}${picker("b", b)}<button class="btn dark" type="submit">Compare</button></form>
     <div id="cmp-out" style="margin-top:16px">${a && b ? loading("Comparing…") : ""}</div>`}
   </div>`;
@@ -757,5 +791,9 @@ function renderComparison(c) {
     </div>`;
 }
 
-route();
+(async () => {
+  const me = await fetch("/api/auth/me").then(r => r.json()).catch(() => null);
+  if (me?.ok) { authInfo = me.data; setUser(me.data.user); } else setUser(null);
+  route();
+})();
 setInterval(() => !document.hidden && refreshSidebar(), 30000);

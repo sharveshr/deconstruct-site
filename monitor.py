@@ -56,6 +56,11 @@ def check_site(site: dict, source="auto") -> dict:
     return check
 
 
+def _check_as_owner(site: dict):
+    with store.as_user(site.get("user_id")):
+        return check_site(site)
+
+
 def _loop():
     last_prune = 0.0
     with ThreadPoolExecutor(max_workers=6) as pool:
@@ -63,7 +68,7 @@ def _loop():
             try:
                 due = store.monitored_sites_due()
                 if due:
-                    list(pool.map(check_site, due))
+                    list(pool.map(_check_as_owner, due))
                 if time.time() - last_prune > 6 * 3600:
                     store.prune_checks()
                     last_prune = time.time()

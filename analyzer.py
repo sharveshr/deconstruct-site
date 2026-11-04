@@ -23,6 +23,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import browser
+import vulns
 from signatures import SIGNATURES
 
 USER_AGENT = (
@@ -918,6 +919,10 @@ def score(seo_r, a11y_r, sec_r, perf_r):
     if sec_r["mixed_content"]:
         sec_points -= 15
     sec_points -= 5 * len(sec_r["version_leaks"])
+    # Each vulnerable library costs by its worst known issue, capped so one old bundle can't zero the score.
+    vl = sec_r.get("vulnerable_libraries") or {}
+    cost = {"critical": 20, "high": 15, "medium": 8, "low": 3}
+    sec_points -= min(40, sum(cost.get(f["severity"], 8) for f in vl.get("findings", [])))
     if perf_r.get("vitals"):
         static_issues = [i for i in perf_r["issues"] if "Contentful Paint" not in i
                          and "Blocking Time" not in i and "Layout Shift" not in i]
@@ -988,6 +993,15 @@ def field_data(url: str) -> dict:
 
 # ---------------------------------------------------------------- entry
 
+def _script_head(session, url: str) -> str | None:
+    """The start of a script, for version banners; None if it can't be fetched safely."""
+    try:
+        resp, body, _ = safe_get(session, url, max_bytes=vulns.SCRIPT_BYTES, timeout=10)
+    except (AnalysisError, requests.RequestException):
+        return None
+    return body.decode("utf-8", "replace") if resp.status_code == 200 else None
+
+
 def analyze(raw_url: str, render: bool = True, perf_runs: int = browser.DEFAULT_PERF_RUNS) -> dict:
     url = normalize_url(raw_url)
     session = _session()
@@ -1010,8 +1024,9 @@ def analyze(raw_url: str, render: bool = True, perf_runs: int = browser.DEFAULT_
     soup = BeautifulSoup(html, "html.parser")
     cookies = _set_cookie_headers(resp)
 
+    checks = vulns.func_checks() if render and browser.AVAILABLE else {}
     with ThreadPoolExecutor(max_workers=6) as pool:
-        browser_f = pool.submit(browser.analyze_rendered, final_url, _host_is_public, perf_runs) if render else None
+        browser_f = pool.submit(browser.analyze_rendered, final_url, _host_is_public, perf_runs, checks) if render else None
         field_f = pool.submit(field_data, final_url)
         css_f = pool.submit(fetch_css, session, soup, final_url)
         res_f = pool.submit(probe_resources, session, collect_resources(soup, final_url))
@@ -1034,10 +1049,15 @@ def analyze(raw_url: str, render: bool = True, perf_runs: int = browser.DEFAULT_
         "response_headers": dict(resp.headers),
         "analyzed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    runtime_versions = browser_r.get("runtime_versions") or {}
+    script_urls = [r["url"] for r in resources if r["type"] == "script"] + (browser_r.get("script_urls") or [])
     if browser_r["available"]:
         merge_browser(report, browser_r, resp, html, soup, cookies)
     else:
         report["browser"] = browser_r
+    tech_versions = {t["name"]: t.get("version") for ts in report["technologies"]["by_category"].values() for t in ts if t.get("version")}
+    report["security"]["vulnerable_libraries"] = vulns.scan(script_urls, fetch=lambda u: _script_head(session, u),
+                                                            tech=tech_versions, runtime=runtime_versions)
     report["performance"]["field"] = field_f.result()
     report["analysis_ms"] = round((time.perf_counter() - t0) * 1000)
     report["scores"] = score(report["seo"], report["accessibility"], sec_r, report["performance"])

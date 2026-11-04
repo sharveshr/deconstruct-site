@@ -46,7 +46,7 @@ function renderReport(d, root, meta = {}) {
     <nav class="tabs" role="tablist">${tabs.map(([id, l], i) => `<button role="tab" data-tab="${id}" aria-selected="${i === 0}">${l}</button>`).join("")}</nav>
     <div class="panel on" data-panel="overview">${renderOverview(d)}</div>
     <div class="panel" data-panel="tech">${renderTech(d)}</div>
-    <div class="panel" data-panel="design">${renderDesign(d)}</div>
+    <div class="panel" data-panel="design">${renderDesign(d, meta)}</div>
     ${d.browser?.available ? `<div class="panel" data-panel="shots">${renderShots(d)}</div>` : ""}
     <div class="panel" data-panel="perf">${renderPerf(d)}</div>
     <div class="panel" data-panel="seo">${renderSeo(d)}</div>
@@ -64,6 +64,7 @@ function renderReport(d, root, meta = {}) {
     b.addEventListener("click", go); b.addEventListener("keydown", e => e.key === "Enter" && go());
   });
   root.querySelectorAll(".sw").forEach(b => b.addEventListener("click", () => navigator.clipboard?.writeText(b.dataset.color)));
+  wireTokens(root, meta);
   $('[data-act="dl"]', root).onclick = () => {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));
@@ -108,7 +109,47 @@ function renderTech(d) {
     ${t.evidence.map(e => `<div class="ev">${esc(e)}</div>`).join("")}</div></div>`).join(""))).join("")}</div>`;
 }
 
-function renderDesign(d) {
+const TOKEN_FORMATS = [["css", "CSS variables"], ["tailwind", "Tailwind v3"], ["tailwind4", "Tailwind v4"], ["json", "Figma / Style Dictionary"], ["scss", "SCSS"]];
+
+function renderTokens(meta) {
+  if (!meta.analysis_id) return "";
+  return card("Export design tokens", `<div class="seg" role="tablist" aria-label="Token format">${TOKEN_FORMATS.map(([f, l], i) =>
+      `<button type="button" role="tab" data-fmt="${f}" aria-selected="${i === 0}">${l}</button>`).join("")}</div>
+    <p class="muted tok-note" style="font-size:12.5px;margin:10px 0">Colors, fonts, type scale, weights, line heights, spacing, radii, shadows, breakpoints and durations, named the way each format expects.</p>
+    <pre class="raw tok-out" style="max-height:340px" tabindex="0">Loading…</pre>
+    <div class="row" style="gap:8px;margin-top:10px"><button class="ghost" data-tok="copy">Copy</button><button class="ghost" data-tok="dl">Download</button></div>`, "wide tokens-card");
+}
+
+function wireTokens(root, meta) {
+  const box = $(".tokens-card", root);
+  if (!box) return;
+  let current = null;
+  const load = async fmt => {
+    box.querySelectorAll("[data-fmt]").forEach(b => b.setAttribute("aria-selected", b.dataset.fmt === fmt));
+    $(".tok-out", box).textContent = "Loading…";
+    try {
+      const r = await fetch(`/api/analyses/${meta.analysis_id}/tokens?format=${fmt}`).then(r => r.json());
+      if (!r.ok) throw new Error(r.error);
+      current = r.data;
+      $(".tok-out", box).textContent = current.content;
+      const n = Object.values(current.counts).reduce((a, b) => a + b, 0);
+      $(".tok-note", box).textContent = `${n} tokens in ${Object.keys(current.counts).length} groups.` + (current.rendered
+        ? " Color roles (background, text, primary) come from what the browser painted."
+        : " This was a quick analysis, so colors are a palette without roles; run it with the browser for background, text and primary colors.");
+    } catch (e) { $(".tok-out", box).textContent = "Couldn't build tokens: " + e.message; }
+  };
+  box.querySelectorAll("[data-fmt]").forEach(b => b.addEventListener("click", () => load(b.dataset.fmt)));
+  $('[data-tok="copy"]', box).onclick = () => current && navigator.clipboard?.writeText(current.content).then(() => typeof toast === "function" && toast("Copied"));
+  $('[data-tok="dl"]', box).onclick = () => {
+    if (!current) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([current.content], { type: "text/plain" }));
+    a.download = current.filename; a.click();
+  };
+  load("css");
+}
+
+function renderDesign(d, meta = {}) {
   const ds = d.design;
   const translucent = c => /^#[0-9a-f]{8}$/.test(c.value) || /^(rgba|hsla)|\/\s*[\d.]+%?\s*\)$/.test(c.value);
   const swatch = list => list.map(c => `<button class="sw" data-color="${esc(c.value)}" title="Copy ${esc(c.value)}"><div class="c"><i style="background:${esc(c.value)}"></i></div>
@@ -138,6 +179,7 @@ function renderDesign(d) {
       <td class="mono">${esc(t["line-height"])}</td><td class="mono">${esc(t["letter-spacing"])}</td><td><span class="mini" style="display:inline-block;width:14px;height:14px;vertical-align:middle;background:${esc(t.color)}"></span></td>
       <td style="font-family:${esc(t["font-family"])};font-weight:${esc(t["font-weight"])};white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(t.sample)}</td></tr>`).join("")}</table></div>`, "wide")}` : "";
   return `<div class="grid">
+    ${renderTokens(meta)}
     ${computedCards}
     ${card(`Color palette from CSS (${ds.colors.length})`, (sw || '<span class="muted">No colors found</span>') + `<p class="muted" style="font-size:12.5px;margin:10px 0 0">Click a swatch to copy it.${ds.theme_color ? ` Theme color: <span class="mono">${esc(ds.theme_color)}</span>` : ""}</p>`, "wide")}
     ${card("Colors by role", roles || '<span class="muted">—</span>')}
@@ -311,9 +353,29 @@ function renderA11y(d) {
   </div>`;
 }
 
+function renderVulnLibs(vl) {
+  if (!vl) return "";
+  if (!vl.available) return card("Vulnerable JavaScript libraries", `<span class="muted">${esc(vl.error)}</span>`, "wide");
+  const sevClass = s => s === "critical" || s === "high" ? "bad" : s === "medium" ? "warn" : "";
+  const body = vl.findings.length ? vl.findings.map(f => `<div class="vuln">
+      <div class="row" style="gap:8px;flex-wrap:wrap"><b>${esc(f.component)} ${esc(f.version)}</b><span class="pill ${sevClass(f.severity)}">${esc(f.severity)}</span>
+        <span class="muted" style="font-size:12.5px">${f.vulnerabilities.length} known issue${f.vulnerabilities.length === 1 ? "" : "s"} · found by ${esc(f.detected_by.join(", "))}</span></div>
+      <div style="font-size:13px;margin:4px 0">${f.upgrade_to ? `Upgrade to <b class="mono">${esc(f.upgrade_to)}</b> or later.` : "No fixed release in this version line (end of life): move to a supported version."}</div>
+      <details><summary class="muted" style="font-size:13px;cursor:pointer">Vulnerabilities</summary>${f.vulnerabilities.map(v => `<div class="issue"><span class="dot ${v.severity === "low" ? "" : "bad"}"></span><div style="min-width:0">
+        ${esc(v.summary)} <span class="pill ${sevClass(v.severity)}">${esc(v.severity)}</span>${v.below ? ` <span class="muted" style="font-size:12px">fixed in ${esc(v.below)}</span>` : ""}
+        <div style="font-size:12px">${[...v.cve, ...(v.ghsa ? [v.ghsa] : [])].map(id => `<span class="mono">${esc(id)}</span>`).join(" · ")}${v.info[0] ? ` · <a href="${esc(v.info[0])}" target="_blank" rel="noopener noreferrer">details</a>` : ""}</div></div></div>`).join("")}</details>
+      ${f.sources.length ? `<div class="mono muted" style="font-size:11.5px;overflow-wrap:anywhere">${f.sources.map(esc).join("<br>")}</div>` : ""}</div>`).join("")
+    : `<div class="issue"><span class="dot good"></span><span>No libraries with known vulnerabilities found.</span></div>`;
+  return card(`Vulnerable JavaScript libraries${vl.findings.length ? ` (${vl.findings.length})` : ""}`, body
+    + (vl.findings.length ? `<p class="muted" style="font-size:12.5px;margin:10px 0 0">Matched by version number. Some issues only apply to certain setups (for example a self-hosted server or a particular feature), so read the details before treating each one as exploitable here.</p>` : "")
+    + `<p class="muted" style="font-size:12.5px;margin:10px 0 0">Checked ${vl.scripts_checked} scripts (${vl.scripts_downloaded} downloaded) against the ${esc(vl.database)} database of ${vl.database_components} libraries.
+      ${vl.libraries_seen.length ? `Versions seen: ${vl.libraries_seen.map(esc).join(", ")}.` : "No library versions could be identified."}</p>`, "wide");
+}
+
 function renderSecurity(d) {
   const s = d.security, t = s.tls;
   return `<div class="grid">
+    ${renderVulnLibs(s.vulnerable_libraries)}
     ${card("Connection", kv([["HTTPS", yes(s.https)], ["HTTP → HTTPS redirect", yes(s.http_redirects_to_https)],
       ["Protocol", esc(s.alpn === "h2" ? "HTTP/2" : s.alpn || "—")],
       t && ["Certificate", t.valid ? `<span class="pill good">Valid</span> ${esc(t.protocol)}` : t.valid === null ? `<span class="pill">Couldn't check</span> <span class="muted">${esc(t.error)}</span>` : `<span class="pill bad">Invalid</span> ${esc(t.error)}`],

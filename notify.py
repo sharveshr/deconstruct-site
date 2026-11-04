@@ -73,6 +73,8 @@ def link_for(event: dict) -> str:
         return f"{APP_URL}/#/sites/{links['uptime']}?tab=uptime"
     if links.get("osint"):
         return f"{APP_URL}/#/osint?target={links['osint']}"
+    if links.get("crawl"):
+        return f"{APP_URL}/#/crawls/{links['crawl']}"
     return f"{APP_URL}/#/alerts"
 
 
@@ -145,8 +147,11 @@ def send_one(channel: dict, event: dict) -> str | None:
 
 
 def _deliver(events: list[dict]):
-    channels = [c for c in store.list_channels() if c["enabled"]]
+    """Each event goes only to its owner's channels. This may run on a fresh thread, which starts
+    with no current user, so the owner is set explicitly."""
     for ev in events:
+        with store.as_user(ev.get("user_id")):
+            channels = [c for c in store.list_channels() if c["enabled"]] if ev.get("user_id") is not None else []
         results = []
         for ch in channels:
             if store.SEVERITY_RANK[ev["severity"]] < store.SEVERITY_RANK[ch["min_severity"]]:
