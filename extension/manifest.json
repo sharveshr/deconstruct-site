@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Deconstruct Site",
+  "version": "1.0.0",
+  "description": "Deconstruct this tab: analyze the page you're on and save it to your Deconstruct Site library.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Deconstruct this tab",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "permissions": ["activeTab", "storage", "contextMenus", "notifications"],
+  "host_permissions": ["http://localhost/*", "http://127.0.0.1/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "background": { "service_worker": "background.js" },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
+}
