@@ -129,6 +129,7 @@ async function route() {
     if (!p0 || p0 === "analyze") return pageAnalyze(q, token);
     if (p0 === "crawls" && p1) return await pageCrawl(+p1, q, token);
     if (p0 === "crawls") return await pageCrawls(q, token);
+    if (p0 === "settings") return await pageSettings(q, token);
     if (p0 === "projects" && p1) return await pageProject(+p1, token);
     if (p0 === "projects") return await pageProjects(q, token);
     if (p0 === "sites" && p1) return await pageSite(+p1, q, token);
@@ -235,7 +236,8 @@ async function runAnalysis(url) {
 async function showResult(res, scroll) {
   const root = $("#report");
   const projects = await api("/api/projects").catch(() => []);
-  const actions = `<a class="ghost" href="#/osint?target=${encodeURIComponent(res.site.host)}">OSINT</a>
+  const actions = `<button class="ghost" data-share="analysis" data-id="${res.analysis_id}">Share & export</button>
+    <a class="ghost" href="#/osint?target=${encodeURIComponent(res.site.host)}">OSINT</a>
     ${res.iteration > 1 ? `<a class="ghost" href="#/compare?a=prev:${res.analysis_id}&b=${res.analysis_id}">Compare with previous</a>` : ""}
     ${projects.length ? `<select class="ghost" data-act="addproj" aria-label="Add to project"><option value="">Add to project…</option>
       ${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>` : ""}`;
@@ -262,10 +264,11 @@ async function pageAnalysis(id, token) {
   const a = await api(`/api/analyses/${id}`);
   if (!fresh(token)) return;
   view.innerHTML = `<div class="wrap"><div class="crumbs" style="padding-top:22px"><a href="#/history">History</a> / <a href="#/sites/${a.site_id}">${esc(a.host)}</a> / Iteration ${a.iteration}</div><div id="report"></div></div>`;
-  const actions = `<a class="ghost" href="#/analyze?url=${encodeURIComponent(a.url)}">Analyze again</a>
+  const actions = `<button class="ghost" data-share="analysis" data-id="${a.id}">Share & export</button>
+    <a class="ghost" href="#/analyze?url=${encodeURIComponent(a.url)}">Analyze again</a>
     <a class="ghost" href="#/osint?target=${encodeURIComponent(a.host)}">OSINT</a>
     ${a.iteration > 1 ? `<a class="ghost" href="#/compare?a=prev:${a.id}&b=${a.id}">Compare with previous</a>` : ""}`;
-  renderReport(a.report, $("#report"), { analysis_id: a.id, iteration: a.iteration, site_id: a.site_id, created_at: a.created_at, label: a.label, actions });
+  renderReport(a.report, $("#report"), { analysis_id: a.id, iteration: a.iteration, site_id: a.site_id, created_at: a.created_at, label: a.label, ai: a.ai, actions });
 }
 
 // ---------------------------------------------------------------- projects

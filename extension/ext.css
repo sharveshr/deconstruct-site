@@ -1,0 +1,44 @@
+:root {
+  --bg: #f6f6f4; --panel: #fff; --panel-2: #f0f0ed; --ink: #141414; --ink-2: #555550; --ink-3: #8a8a84; --line: #e4e4df;
+  --good: #12805c; --warn: #b26a00; --bad: #c62e2e; --good-bg: #e6f4ee; --warn-bg: #fdf1dc; --bad-bg: #fbe7e7;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f0f0e; --panel: #181817; --panel-2: #222220; --ink: #f1f1ee; --ink-2: #b4b4ad; --ink-3: #7c7c76; --line: #2c2c29;
+    --good: #4cc996; --warn: #f0b04c; --bad: #ff7676; --good-bg: #13291f; --warn-bg: #2e2412; --bad-bg: #321717; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.popup { width: 340px; }
+header { display: flex; align-items: center; gap: 9px; padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header .link { margin-left: auto; border: 0; background: none; color: var(--ink-2); font: inherit; font-size: 12.5px; cursor: pointer; }
+.logo { width: 18px; height: 18px; border-radius: 50%; background: var(--ink); position: relative; flex: none; }
+.logo::after { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: var(--panel); }
+main { padding: 14px; }
+.muted { color: var(--ink-3); }
+.url { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.target { margin-bottom: 12px; }
+.primary { display: inline-block; border: 0; background: var(--ink); color: var(--bg); font: inherit; font-weight: 600; padding: 10px 14px; border-radius: 10px; cursor: pointer; text-align: center; text-decoration: none; }
+.primary.block { display: block; width: 100%; }
+.ghost { flex: 1; border: 1px solid var(--line); background: var(--panel); color: var(--ink); font: inherit; font-size: 13px; padding: 7px 8px; border-radius: 8px; cursor: pointer; text-align: center; text-decoration: none; }
+.row { display: flex; gap: 6px; margin-top: 12px; }
+.check { display: flex; gap: 6px; align-items: flex-start; font-size: 12.5px; color: var(--ink-2); margin-top: 8px; }
+.status { display: flex; gap: 8px; align-items: center; padding: 10px; border-radius: 10px; background: var(--panel-2); font-size: 13px; margin-bottom: 10px; }
+.spinner { width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--ink); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.result { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 10px; }
+.scores { display: flex; gap: 6px; margin-bottom: 10px; }
+.ms { flex: 1; text-align: center; font-weight: 700; border-radius: 8px; padding: 4px 0; background: var(--panel-2); }
+.ms small { display: block; font-weight: 500; font-size: 11px; opacity: .75; }
+.ms.g { color: var(--good); background: var(--good-bg); } .ms.w { color: var(--warn); background: var(--warn-bg); } .ms.b { color: var(--bad); background: var(--bad-bg); }
+.error { color: var(--bad); background: var(--bad-bg); padding: 8px 10px; border-radius: 8px; font-size: 13px; margin: 0 0 10px; }
+.ok { color: var(--good); }
+.recent { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.recent .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.recent a { color: var(--ink-2); font-size: 13px; }
+.options main { max-width: 520px; margin: 40px auto; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 0 0 24px; overflow: hidden; }
+.options main > :not(header) { margin-left: 24px; margin-right: 24px; }
+.options h1 { font-size: 21px; margin-top: 22px; margin-bottom: 4px; }
+.options label { display: block; font-weight: 600; font-size: 13px; margin: 14px 0 6px; }
+.options input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font: inherit; }
+.options .small { font-size: 12.5px; }
+.options button { margin-top: 10px; }

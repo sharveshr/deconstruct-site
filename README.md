@@ -1,7 +1,9 @@
 # Deconstruct Site
 
 Paste a website URL and get a full report on how it's built. Crawl whole sites, run passive OSINT and security
-lookups, watch sites for changes, and export a site's design system as tokens. Each account has its own private library.
+lookups, watch sites for changes, and export a site's design system as tokens. Ask Claude about a report with your own
+Anthropic API key, share branded reports with clients, and deconstruct any tab from the browser extension. Each account
+has its own private library.
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/sharveshr/deconstruct-site)
 
@@ -53,8 +55,8 @@ To deploy:
    to access it). Keep the defaults; `vercel.json` sets the build.
 2. Under **Environment Variables**, add `SECRET_KEY` (any long random string; it signs sign-in cookies, and without it
    each instance signs people out). Add `ALLOW_SIGNUP=0` to stop strangers creating accounts, or `APP_PASSWORD` to put
-   the whole site behind one password (the browser asks for it, any username). Optionally add `CRUX_API_KEY` for
-   real-user vitals and `APP_URL` for notification links.
+   the whole site behind one password (the browser asks for it, any username; share links and API tokens skip it).
+   Optionally add `CRUX_API_KEY` for real-user vitals and `APP_URL` for notification links.
 3. Deploy. Every push to `main` redeploys; other branches get preview URLs.
 
 For the full app (browser pass, monitoring, data that persists) use a host that runs a long-lived server with a disk,
@@ -75,6 +77,71 @@ notification channels, and background monitoring and watching run as the site's 
   `SameSite=Lax`.
 - **Not built yet:** password reset by email and team sharing.
 
+## AI with your own API key
+
+The **AI** tab on every saved report uses Claude through the official `anthropic` Python SDK:
+
+| Feature | What it does |
+|---|---|
+| Summary | A plain-English read for the site owner: what it's built with, how each area scores and why, the three fixes that matter most, and what works |
+| Prioritized fixes | 5 to 10 fixes ranked by impact for effort, each with the evidence from the report, why it matters, how to do it and a code snippet. Returned as JSON validated against a schema |
+| Ask about this report | A chat over the report, keeping earlier turns |
+| Component to code | Sends the captured header, footer or form screenshot plus its measured styles, and gets back HTML + CSS, Tailwind or a React component, with a sandboxed live preview for HTML and Tailwind |
+
+**Every AI request runs on the signed-in user's own Anthropic API key**, so usage is billed to their Anthropic account,
+never the server's. Each user adds a key under **Settings**:
+
+- The key is kept only in that browser (`localStorage`, or just for the tab session when "Remember" is off) and sent
+  in an `X-Anthropic-Key` header on AI requests only.
+- The server uses it for that one request and never stores or logs it. Keys are checked with a free models lookup
+  ("Save and test").
+- Users pick the model: Claude Opus 5.5 (default), Sonnet 5.5 or Haiku 5.5.
+- The report (about 10,000 tokens once screenshots are removed) is sent as a cached system prompt, so a summary,
+  fix list and follow-up questions on the same report reuse it at the cached rate.
+- Opus and Sonnet requests opt into Anthropic's server-side fallback (`fallbacks: "default"`), which retries a request
+  the model's safety classifiers decline on another model. Haiku 5.5 has no fallback. A request that's still declined
+  shows "Claude declined this request".
+- Summaries, fix lists and generated components are saved with the analysis, so they show up again later and in
+  shared reports and exports.
+- The server needs no Anthropic key of its own.
+
+## Sharing, exports and agency branding
+
+**Share & export** on a report or crawl:
+
+- **Download** a PDF (printed by headless Chromium; where Playwright isn't installed, as on Vercel, the print view
+  opens and the browser's "Save as PDF" makes it), Markdown, or a print view.
+- **Read-only links** at `/s/<token>`: anyone with the link can view that one report or crawl without an account.
+  - Choose an expiry (1, 7, 30 or 90 days, or never) and whether to include the AI summary and fixes.
+  - See the view count, and turn a link off at any time. All links are listed in **Settings**.
+  - Shared pages are marked `noindex`. A shared crawl shows its summary; the per-page table stays private.
+
+**Agency branding** (Settings) puts your name, logo (PNG, JPEG or WebP under 300 KB), brand color, website and contact
+line on shared pages, PDFs and Markdown, and can hide the "Made with Deconstruct Site" credit.
+
+## Browser extension
+
+`extension/` is a Chrome / Edge (Manifest V3) extension:
+
+- **Deconstruct this tab:** the popup analyzes the page you're on (full or quick) and saves it to your library.
+- **Right-click menu:** "Deconstruct this page" and "Deconstruct this link".
+- **Shortcuts:** crawl the site, or open OSINT on it.
+
+Analyses run in the extension's background worker, so closing the popup doesn't cancel them; a notification links to
+the report when it's saved.
+
+To install it:
+
+1. Download it from **Settings → Browser extension and API tokens** (or use the `extension/` folder).
+2. Open `chrome://extensions`, turn on Developer mode, choose **Load unpacked** and pick the folder.
+3. In the extension's options, enter the server's address and an API token.
+
+**API tokens:** the extension signs in with a personal token, created in Settings and shown once.
+- The server keeps only its SHA-256 hash.
+- The token is sent as `Authorization: Bearer dst_…`, can do anything its owner can, and is revoked in Settings.
+- A token can't create further tokens.
+- The extension asks for access to your server's address when you save it; `localhost` needs no prompt.
+
 ## The sidebar
 
 | Page | What it does |
@@ -87,6 +154,7 @@ notification channels, and background monitoring and watching run as the site's 
 | History | Every analysis you've ever run, grouped by day and searchable, so nothing gets lost. |
 | Alerts | What changed between runs, with notification channels and per-site watch schedules (see below). |
 | OSINT | Fifteen passive lookups for a domain, run in parallel; each result card fills in as its source answers, and results are saved (see below). |
+| Settings | Your Anthropic API key and model, agency branding, API tokens and the extension download, and every share link. |
 | Compare | Two different sites, or two iterations of one site, side by side: a scoreboard of measured metrics (scores, Core Web Vitals, page weight, requests, contrast failures…) with the winner of each, plus tech, issues, security headers, colors and fonts that differ. |
 
 ### Crawl
@@ -214,6 +282,13 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 | `GET /api/analyses/<id>/tokens?format=` | Design tokens (see above) |
 | `GET/POST /api/crawls` `{url, max_pages, max_depth?}` · `GET/DELETE /api/crawls/<id>` · `POST /api/crawls/<id>/stop` | Crawls; GET returns progress and, when done, the summary |
 | `GET /api/crawls/<id>/pages?issue=&q=&sort=&dir=` · `GET /api/crawls/<id>/pages.csv` | Crawled pages with their issues |
+| `POST /api/analyses/<id>/ai/summary` · `…/ai/ask` `{question, history}` · `…/ai/component` `{component, framework}` | AI, streamed as server-sent events; needs `X-Anthropic-Key` (and optionally `X-Anthropic-Model`) |
+| `POST /api/analyses/<id>/ai/fixes` · `POST /api/ai/check` · `GET /api/ai/models` | Fix list as JSON; key check; available models |
+| `GET /api/analyses/<id>/report.{pdf,md,html,print}` · `GET /api/crawls/<id>/report.{pdf,md,html,print}` | Exports with your branding |
+| `GET/POST /api/shares` `{kind, id, expires_days, include_ai}` · `DELETE /api/shares/<id>` | Share links |
+| `GET /api/public/<token>` · `GET /api/public/<token>/report.{pdf,md}` · `GET /s/<token>` | What a share link shows (no account needed) |
+| `GET/PUT /api/settings/branding` | Agency branding |
+| `GET/POST /api/tokens` · `DELETE /api/tokens/<id>` · `GET /api/whoami` · `GET /api/extension.zip` | API tokens and the extension |
 
 ## Files
 
@@ -227,6 +302,8 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 - `crawl.py` — the multi-page crawler and its summary
 - `tokens.py` — design-token export
 - `vulns.py` — vulnerable JavaScript libraries (retire.js)
+- `ai.py` — the AI features, on each user's own Anthropic API key
+- `report_export.py` — Markdown, printable HTML and PDF exports
 - `monitor.py` — background thread that checks monitored sites on their interval
 - `compare.py` — diff between two saved reports
 - `osint.py` — the fifteen OSINT tools
@@ -236,6 +313,9 @@ All responses are `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`
 - `static/osint.js` — the OSINT page
 - `static/crawl.js` — the Crawl pages
 - `static/home.js`, `static/img/features/` — the home page and its screenshots, and the sign-in / sign-up pages
+- `static/ai.js`, `static/settings.js`, `static/share-ui.js` — the AI tab, Settings, and the Share & export dialog
+- `static/share.html`, `static/share.js` — the public page behind a share link
+- `extension/` — the browser extension
 - `scripts/make_thumbnails.py` — retakes the home page screenshots from a running copy of the app
 - `static/index.html`, `app.js`, `app.css` — app shell, sidebar and library pages
 - `static/report.js`, `styles.css` — the report view

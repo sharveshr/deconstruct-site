@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Deconstruct Site: options</title>
+<link rel="stylesheet" href="ext.css">
+</head>
+<body class="options">
+<main>
+  <header><span class="logo" aria-hidden="true"></span><b>Deconstruct Site</b></header>
+  <h1>Connect to your server</h1>
+  <p class="muted">The extension saves analyses to your account on your Deconstruct Site server.</p>
+  <form id="form">
+    <label for="server">Server address</label>
+    <input id="server" type="url" placeholder="https://deconstruct.example.com" required>
+    <label for="token">API token</label>
+    <input id="token" type="password" placeholder="dst_…" required autocomplete="off" spellcheck="false">
+    <p class="muted small">Create a token in the app under <b>Settings → Browser extension and API tokens</b>.</p>
+    <button class="primary" type="submit">Save and test</button>
+  </form>
+  <div id="status" role="status"></div>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

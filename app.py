@@ -7,18 +7,22 @@ raised when a newer result differs from the previous one.
 import csv
 import hmac
 import io
+import json
 import logging
 import os
 import re
 import secrets
 import threading
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, Response, abort, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, abort, g, jsonify, request, send_from_directory, session, stream_with_context
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import ai
 import browser
+import report_export
 import crawl
 import monitor
 import notify
@@ -69,12 +73,16 @@ app.config.update(
     SESSION_REFRESH_EACH_REQUEST=False,
 )
 PUBLIC_API = {"/api/health", "/api/auth/me", "/api/auth/signin", "/api/auth/signup", "/api/auth/signout"}
+PUBLIC_PREFIXES = ("/api/public/",)   # read-only share links
 
 
 @app.before_request
 def require_password():
-    """With APP_PASSWORD set, every page and API call needs it (any username) via HTTP Basic auth."""
-    if not APP_PASSWORD:
+    """With APP_PASSWORD set, every page and API call needs it (any username) via HTTP Basic auth, except
+    share links (meant for people without an account), the app's static files they load, and API tokens."""
+    if not APP_PASSWORD or request.path.startswith(("/s/", "/static/", *PUBLIC_PREFIXES)):
+        return None
+    if request.headers.get("Authorization", "").startswith("Bearer dst_"):
         return None
     auth = request.authorization
     if auth and hmac.compare_digest((auth.password or "").encode(), APP_PASSWORD.encode()):
@@ -88,11 +96,19 @@ def require_account():
     Changes must come from the app's own fetch() (a custom header a cross-site form can't send)."""
     if not request.path.startswith("/api/"):
         return None
-    if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("X-Requested-With") != "fetch":
-        return fail("Missing the X-Requested-With: fetch header.", 403)
-    if request.path in PUBLIC_API:
-        return None
-    user = store.get_user(session["uid"]) if session.get("uid") else None
+    bearer = request.headers.get("Authorization", "")
+    if bearer.startswith("Bearer dst_"):
+        # API tokens (the browser extension): no cookie is involved, so there's nothing to forge cross-site.
+        user = store.user_for_api_token(bearer[7:].strip())
+        if not user:
+            return jsonify(ok=False, error="That API token isn't valid. Create a new one in Settings.", auth="required"), 401
+        g.via_token = True
+    else:
+        if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("X-Requested-With") != "fetch":
+            return fail("Missing the X-Requested-With: fetch header.", 403)
+        if request.path in PUBLIC_API or request.path.startswith(PUBLIC_PREFIXES):
+            return None
+        user = store.get_user(session["uid"]) if session.get("uid") else None
     if not user:
         return jsonify(ok=False, error="Sign in to continue.", auth="required"), 401
     g.user = user
@@ -479,6 +495,291 @@ def api_osint(tool):
         return fail(str(e))
     success, result = watch.run_osint(tool, target)
     return ok(result) if success else fail(result["error"], result["status"])
+
+
+# ---------------------------------------------------------------- AI (the user's own Anthropic key)
+
+def _ai_key() -> str | None:
+    # Sent by the browser on AI requests only; used for this call and never stored or logged.
+    return request.headers.get("X-Anthropic-Key")
+
+
+def _ai_model() -> str:
+    return request.headers.get("X-Anthropic-Model") or ai.DEFAULT_MODEL
+
+
+def _sse(events, on_done=None):
+    """Streams ("text", chunk) / ("done", result) events to the browser as server-sent events."""
+    uid = store.current_user()
+
+    def event(payload: dict) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def run():
+        try:
+            for kind, data in events:
+                if kind == "text":
+                    yield event({"type": "text", "text": data})
+                else:
+                    if on_done:
+                        with store.as_user(uid):
+                            on_done(data)
+                    yield event({"type": "done", **data})
+        except ai.AIError as e:
+            yield event({"type": "error", "error": str(e), "status": e.status})
+        except Exception:  # noqa: BLE001 - never leak details (or the key) into the stream
+            log.exception("AI stream failed")
+            yield event({"type": "error", "error": "The AI request failed unexpectedly.", "status": 500})
+    return Response(stream_with_context(run()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _ai_analysis(aid):
+    a = need(store.get_analysis(aid), "That analysis doesn't exist.")
+    ai.client_for(_ai_key())   # reject a missing or malformed key before streaming starts
+    return a
+
+
+@app.errorhandler(ai.AIError)
+def _ai_error(e):
+    return fail(str(e), e.status)
+
+
+@app.get("/api/ai/models")
+def api_ai_models():
+    return ok({"models": [{"id": k, "name": v} for k, v in ai.MODELS.items()], "default": ai.DEFAULT_MODEL})
+
+
+@app.post("/api/ai/check")
+def api_ai_check():
+    return ok(ai.check_key(_ai_key(), _ai_model()))
+
+
+@app.post("/api/analyses/<int:aid>/ai/summary")
+def api_ai_summary(aid):
+    a = _ai_analysis(aid)
+    return _sse(ai.summary(_ai_key(), _ai_model(), a["report"]),
+                lambda d: store.save_analysis_ai(aid, "summary", {k: d[k] for k in ("text", "model")} | {"created_at": store.now_iso()}))
+
+
+@app.post("/api/analyses/<int:aid>/ai/fixes")
+def api_ai_fixes(aid):
+    a = _ai_analysis(aid)
+    result = ai.fixes(_ai_key(), _ai_model(), a["report"])
+    store.save_analysis_ai(aid, "fixes", {"fixes": result["fixes"], "model": result["model"], "created_at": store.now_iso()})
+    return ok(result)
+
+
+@app.post("/api/analyses/<int:aid>/ai/ask")
+def api_ai_ask(aid):
+    a = _ai_analysis(aid)
+    b = body()
+    q = str(b.get("question", "")).strip()
+    if not q:
+        return fail("Ask a question.")
+    history = b.get("history") if isinstance(b.get("history"), list) else []
+    return _sse(ai.ask(_ai_key(), _ai_model(), a["report"], history, q))
+
+
+@app.post("/api/analyses/<int:aid>/ai/component")
+def api_ai_component(aid):
+    a = _ai_analysis(aid)
+    b = body()
+    comp, fw = str(b.get("component", "")), str(b.get("framework", "tailwind"))
+    events = ai.component_code(_ai_key(), _ai_model(), a["report"], comp, fw)
+    saved = a["ai"].get("components", {})
+    return _sse(events, lambda d: store.save_analysis_ai(aid, "components", saved | {f"{comp}:{fw}": {"text": d["text"], "model": d["model"]}}))
+
+
+# ---------------------------------------------------------------- exports, share links, branding
+
+def _export(kind: str, obj: dict, fmt: str, branding: dict, ai_results: dict | None):
+    if kind == "analysis":
+        title, sub, secs = report_export.analysis_sections(obj, ai_results)
+    else:
+        if not obj.get("summary"):
+            return fail("This crawl hasn't finished yet.", 409)
+        title, sub, secs = report_export.crawl_sections(obj)
+    name = re.sub(r"[^A-Za-z0-9.-]+", "-", obj.get("host") or "report")[:60] + f"-{kind}-{obj['id']}"
+    if fmt == "md":
+        return Response(report_export.to_markdown(title, sub, secs, branding), mimetype="text/markdown",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.md"'})
+    doc = report_export.to_html(title, sub, secs, branding, auto_print=fmt == "print")
+    if fmt == "pdf":
+        pdf = report_export.to_pdf(doc)
+        if pdf is None:
+            # No headless browser here (Vercel): the printable page and the browser's "Save as PDF" stand in.
+            return jsonify(ok=False, error="PDF printing isn't available on this server.", print=True), 501
+        return Response(pdf, mimetype="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+    return Response(doc, mimetype="text/html", headers={"X-Robots-Tag": "noindex"})
+
+
+EXPORT_FORMATS = ("md", "pdf", "html", "print")
+
+
+@app.get("/api/analyses/<int:aid>/report.<fmt>")
+def api_analysis_export(aid, fmt):
+    if fmt not in EXPORT_FORMATS:
+        abort(404)
+    a = need(store.get_analysis(aid), "That analysis doesn't exist.")
+    return _export("analysis", a, fmt, store.get_branding(), a["ai"])
+
+
+@app.get("/api/crawls/<int:cid>/report.<fmt>")
+def api_crawl_export(cid, fmt):
+    if fmt not in EXPORT_FORMATS:
+        abort(404)
+    return _export("crawl", need(store.get_crawl(cid), "That crawl doesn't exist."), fmt, store.get_branding(), None)
+
+
+SHARE_DAYS = (0, 1, 7, 30, 90)
+
+
+@app.get("/api/shares")
+def api_shares():
+    a = request.args
+    return ok(store.list_shares(a.get("kind"), a.get("ref_id", type=int)))
+
+
+@app.post("/api/shares")
+def api_share_create():
+    b = body()
+    kind = b.get("kind")
+    try:
+        ref_id, days = int(b.get("id")), int(b.get("expires_days", 30))
+    except (TypeError, ValueError):
+        return fail("Give the id of an analysis or crawl.")
+    if kind not in ("analysis", "crawl"):
+        return fail("kind must be analysis or crawl.")
+    if days not in SHARE_DAYS:
+        return fail(f"expires_days must be one of {SHARE_DAYS} (0 = never).")
+    need(store.get_analysis(ref_id) if kind == "analysis" else store.get_crawl(ref_id), "Nothing to share with that id.")
+    expires = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ") if days else None
+    return ok(store.create_share(kind, ref_id, expires, b.get("include_ai", True) is not False), 201)
+
+
+@app.delete("/api/shares/<int:sid>")
+def api_share_delete(sid):
+    store.delete_share(sid)
+    return ok()
+
+
+def _shared(token):
+    """The live share link and what it points to, read as the account that shared it."""
+    sh = need(store.share_by_token(token), "This link has expired or been turned off.")
+    with store.as_user(sh["user_id"]):
+        obj = store.get_analysis(sh["ref_id"]) if sh["kind"] == "analysis" else store.get_crawl(sh["ref_id"])
+        branding = store.get_branding()
+    if not obj:
+        abort(404, "What this link pointed to has been deleted.")
+    return sh, obj, branding
+
+
+def _public_branding(b: dict) -> dict:
+    return {k: b.get(k) for k in ("name", "logo", "color", "url", "contact", "hide_credit")} if b.get("enabled") else {}
+
+
+@app.get("/api/public/<token>")
+def api_public(token):
+    sh, obj, branding = _shared(token)
+    store.count_share_view(sh["id"])
+    if sh["kind"] == "analysis":
+        data = {k: obj[k] for k in ("id", "host", "url", "created_at", "iteration", "report")}
+        data["ai"] = {k: obj["ai"][k] for k in ("summary", "fixes") if sh["include_ai"] and obj["ai"].get(k)}
+    else:
+        data = {k: obj[k] for k in ("id", "host", "root_url", "status", "max_pages", "created_at", "finished_at", "summary")}
+        if data["summary"]:
+            data["summary"] = {k: v for k, v in data["summary"].items() if k not in ("page_issues", "inlinks")}
+    return ok({"kind": sh["kind"], "shared_at": sh["created_at"], "expires_at": sh["expires_at"],
+               "branding": _public_branding(branding), "data": data, "pdf": browser.AVAILABLE})
+
+
+@app.get("/api/public/<token>/report.<fmt>")
+def api_public_export(token, fmt):
+    if fmt not in EXPORT_FORMATS:
+        abort(404)
+    sh, obj, branding = _shared(token)
+    ai_results = obj.get("ai") if sh["kind"] == "analysis" and sh["include_ai"] else None
+    return _export(sh["kind"], obj, fmt, branding, ai_results)
+
+
+@app.get("/s/<token>")
+def share_page(token):
+    resp = send_from_directory(app.static_folder, "share.html")
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
+
+
+LOGO_RE = re.compile(r"^data:image/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$")
+
+
+@app.get("/api/settings/branding")
+def api_branding():
+    return ok(store.get_branding())
+
+
+@app.put("/api/settings/branding")
+def api_branding_save():
+    b = body()
+    out = {"enabled": bool(b.get("enabled")), "name": str(b.get("name") or "").strip()[:80],
+           "contact": str(b.get("contact") or "").strip()[:200], "hide_credit": bool(b.get("hide_credit"))}
+    url = str(b.get("url") or "").strip()
+    if url and not re.match(r"^https?://\S+$", url):
+        return fail("The website must start with http:// or https://.")
+    out["url"] = url[:200]
+    color = str(b.get("color") or "").strip()
+    if color and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        return fail("Pick the brand color as a hex value like #1f5eff.")
+    out["color"] = color
+    logo = b.get("logo") or ""
+    if logo:
+        if not LOGO_RE.match(logo):
+            return fail("The logo must be a PNG, JPEG or WebP image.")
+        if len(logo) > 400_000:
+            return fail("The logo is too large; use an image under 300 KB.")
+    out["logo"] = logo
+    store.set_branding(out)
+    return ok(out)
+
+
+# ---------------------------------------------------------------- API tokens and the browser extension
+
+@app.get("/api/whoami")
+def api_whoami():
+    """The account a session or API token belongs to (the extension's connection test)."""
+    return ok(g.user)
+
+
+@app.get("/api/tokens")
+def api_tokens():
+    return ok(store.list_api_tokens())
+
+
+@app.post("/api/tokens")
+def api_token_create():
+    if g.get("via_token"):
+        return fail("Create tokens in the app's Settings, not with another token.", 403)
+    row, token = store.create_api_token(str(body().get("name") or "Browser extension"))
+    return ok(row | {"token": token}, 201)
+
+
+@app.delete("/api/tokens/<int:tid>")
+def api_token_delete(tid):
+    store.delete_api_token(tid)
+    return ok()
+
+
+@app.get("/api/extension.zip")
+def api_extension_zip():
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for dirpath, _, files in os.walk(root):
+            for f in files:
+                full = os.path.join(dirpath, f)
+                z.write(full, os.path.relpath(full, root))
+    return Response(buf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="deconstruct-site-extension.zip"'})
 
 
 # ---------------------------------------------------------------- crawls

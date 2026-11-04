@@ -75,7 +75,8 @@ async function pageCrawl(id, q, token) {
       <p>${link(c.root_url)} · started ${esc(fmtTime(c.created_at))} · up to ${c.max_pages} pages${s?.duration_s != null ? ` · took ${duration(s.duration_s)}` : ""}</p></div>
       <div class="row">${live ? '<button class="btn" id="crawl-stop">Stop</button>' : `
         <button class="btn" id="crawl-again">Crawl again</button>
-        ${s ? `<a class="btn" href="/api/crawls/${c.id}/pages.csv" download>Download CSV</a>` : ""}`}
+        ${s ? `<button class="btn" data-share="crawl" data-id="${c.id}">Share & export</button>
+          <a class="btn" href="/api/crawls/${c.id}/pages.csv" download>Download CSV</a>` : ""}`}
         ${c.site_id ? `<a class="btn" href="#/sites/${c.site_id}">Site</a>` : ""}
         <button class="btn danger" id="crawl-del">Delete</button></div></div>
     <div id="crawl-body">${live ? crawlProgress(c) : c.status === "error" ? `<div class="error" style="display:block">This crawl failed: ${esc(c.error)}</div>` : crawlResults(c)}</div>

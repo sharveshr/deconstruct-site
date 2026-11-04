@@ -24,7 +24,8 @@ const bars = (items, label = i => i.value) => {
 
 function renderReport(d, root, meta = {}) {
   const o = d.overview, s = d.scores;
-  const tabs = [["overview", "Overview"], ["tech", `Technology (${d.technologies.count})`], ["design", "Design"],
+  const tabs = [["overview", "Overview"], ...(meta.analysis_id && typeof renderAiTab === "function" ? [["ai", "AI"]] : []),
+    ["tech", `Technology (${d.technologies.count})`], ["design", "Design"],
     ...(d.browser?.available ? [["shots", "Screenshots"]] : []), ["perf", "Performance"],
     ["seo", "SEO"], ["a11y", "Accessibility"], ["security", "Security"], ["structure", "Structure"], ["raw", "Raw data"]];
   const scoreCards = [["perf", "Performance", s.performance, `${d.performance.issues.length} issues`],
@@ -45,6 +46,7 @@ function renderReport(d, root, meta = {}) {
       <div><div class="lbl">${l}</div><div class="hint">${h}</div></div></div>`).join("")}</div>
     <nav class="tabs" role="tablist">${tabs.map(([id, l], i) => `<button role="tab" data-tab="${id}" aria-selected="${i === 0}">${l}</button>`).join("")}</nav>
     <div class="panel on" data-panel="overview">${renderOverview(d)}</div>
+    ${meta.analysis_id && typeof renderAiTab === "function" ? `<div class="panel" data-panel="ai">${renderAiTab(d, meta)}</div>` : ""}
     <div class="panel" data-panel="tech">${renderTech(d)}</div>
     <div class="panel" data-panel="design">${renderDesign(d, meta)}</div>
     ${d.browser?.available ? `<div class="panel" data-panel="shots">${renderShots(d)}</div>` : ""}
@@ -65,6 +67,7 @@ function renderReport(d, root, meta = {}) {
   });
   root.querySelectorAll(".sw").forEach(b => b.addEventListener("click", () => navigator.clipboard?.writeText(b.dataset.color)));
   wireTokens(root, meta);
+  if (typeof wireAiTab === "function") wireAiTab(root, d, meta);
   $('[data-act="dl"]', root).onclick = () => {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));

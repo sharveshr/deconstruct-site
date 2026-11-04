@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import contextvars
 import gzip
+import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -70,7 +72,8 @@ CREATE TABLE IF NOT EXISTS analyses (
   label TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL,
   thumb TEXT,
-  report BLOB NOT NULL
+  report BLOB NOT NULL,
+  ai TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS analyses_site ON analyses(site_id, created_at);
 CREATE TABLE IF NOT EXISTS checks (
@@ -157,6 +160,31 @@ CREATE TABLE IF NOT EXISTS crawl_pages (
   UNIQUE (crawl_id, url)
 );
 CREATE INDEX IF NOT EXISTS crawl_pages_state ON crawl_pages(crawl_id, state);
+CREATE TABLE IF NOT EXISTS shares (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK (kind IN ('analysis', 'crawl')),
+  ref_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  include_ai INTEGER NOT NULL DEFAULT 1,
+  views INTEGER NOT NULL DEFAULT 0,
+  last_viewed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  branding TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  prefix TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT
+);
 CREATE TABLE IF NOT EXISTS crawl_links (
   id INTEGER PRIMARY KEY,
   crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
@@ -247,6 +275,8 @@ def init():
         for table in OWNED_TABLES:
             if "user_id" not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+        if "ai" not in {r["name"] for r in c.execute("PRAGMA table_info(analyses)")}:
+            c.execute("ALTER TABLE analyses ADD COLUMN ai TEXT NOT NULL DEFAULT '{}'")
         c.execute("CREATE INDEX IF NOT EXISTS sites_user ON sites(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS events_user ON events(user_id, id)")
         c.execute("CREATE INDEX IF NOT EXISTS osint_user ON osint_results(user_id, target)")
@@ -562,7 +592,21 @@ def get_analysis(analysis_id: int) -> dict | None:
         iteration = c.execute("SELECT COUNT(*) FROM analyses WHERE site_id = ? AND (created_at < ? OR (created_at = ? AND id <= ?))",
                               (r["site_id"], r["created_at"], r["created_at"], r["id"])).fetchone()[0]
     return {"id": r["id"], "site_id": r["site_id"], "url": r["url"], "host": r["host"], "created_at": r["created_at"],
-            "label": r["label"], "iteration": iteration, "report": json.loads(gzip.decompress(r["report"]))}
+            "label": r["label"], "iteration": iteration, "report": json.loads(gzip.decompress(r["report"])),
+            "ai": json.loads(r["ai"] or "{}")}
+
+
+def save_analysis_ai(analysis_id: int, key: str, value):
+    """Keeps an AI result (summary, fixes, generated component code) with the analysis it was made from."""
+    own, args = _own()
+    with db() as c:
+        r = c.execute(f"SELECT ai FROM analyses WHERE id = ? AND site_id IN (SELECT id FROM sites WHERE {own})",
+                      (analysis_id, *args)).fetchone()
+        if not r:
+            return
+        data = json.loads(r["ai"] or "{}")
+        data[key] = value
+        c.execute("UPDATE analyses SET ai = ? WHERE id = ?", (json.dumps(data), analysis_id))
 
 
 def update_analysis_label(analysis_id: int, label: str):
@@ -1048,3 +1092,95 @@ def previous_crawl(site_id: int, before_id: int) -> dict | None:
         r = c.execute("SELECT * FROM crawls WHERE site_id = ? AND id < ? AND status = 'done' ORDER BY id DESC LIMIT 1",
                       (site_id, before_id)).fetchone()
     return _crawl_row(r) if r else None
+
+
+# ---------------------------------------------------------------- share links, branding, API tokens
+
+def create_share(kind: str, ref_id: int, expires_at: str | None, include_ai: bool) -> dict:
+    with db() as c:
+        cur = c.execute("""INSERT INTO shares (user_id, token, kind, ref_id, created_at, expires_at, include_ai)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (_user.get(), secrets.token_urlsafe(18), kind, ref_id, now_iso(), expires_at, 1 if include_ai else 0))
+        return dict(c.execute("SELECT * FROM shares WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+
+def list_shares(kind: str | None = None, ref_id: int | None = None) -> list[dict]:
+    own, args = _own()
+    q = f"SELECT * FROM shares WHERE {own}"
+    if kind:
+        q += " AND kind = ?"; args = [*args, kind]
+    if ref_id is not None:
+        q += " AND ref_id = ?"; args = [*args, ref_id]
+    with db() as c:
+        return [dict(r) for r in c.execute(q + " ORDER BY id DESC", args).fetchall()]
+
+
+def delete_share(share_id: int):
+    own, args = _own()
+    with db() as c:
+        c.execute(f"DELETE FROM shares WHERE id = ? AND {own}", (share_id, *args))
+
+
+def share_by_token(token: str) -> dict | None:
+    """A live share link (not revoked, not expired); public, so not scoped to a user."""
+    with db() as c:
+        r = c.execute("SELECT * FROM shares WHERE token = ?", (token,)).fetchone()
+    if not r or (r["expires_at"] and parse_iso(r["expires_at"]) < datetime.now(timezone.utc)):
+        return None
+    return dict(r)
+
+
+def count_share_view(share_id: int):
+    with db() as c:
+        c.execute("UPDATE shares SET views = views + 1, last_viewed_at = ? WHERE id = ?", (now_iso(), share_id))
+
+
+def get_branding(user_id: int | None = None) -> dict:
+    uid = user_id if user_id is not None else _user.get()
+    with db() as c:
+        r = c.execute("SELECT branding FROM user_settings WHERE user_id = ?", (uid,)).fetchone()
+    return json.loads(r["branding"]) if r else {}
+
+
+def set_branding(branding: dict):
+    with db() as c:
+        c.execute("""INSERT INTO user_settings (user_id, branding) VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET branding = excluded.branding""", (_user.get(), json.dumps(branding)))
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_api_token(name: str) -> tuple[dict, str]:
+    """Returns the token row and the token itself, which is shown once and only its hash is kept."""
+    token = "dst_" + secrets.token_urlsafe(32)
+    with db() as c:
+        cur = c.execute("INSERT INTO api_tokens (user_id, name, token_hash, prefix, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (_user.get(), name.strip()[:60] or "Token", _token_hash(token), token[:10], now_iso()))
+        row = dict(c.execute("SELECT id, name, prefix, created_at, last_used_at FROM api_tokens WHERE id = ?", (cur.lastrowid,)).fetchone())
+    return row, token
+
+
+def list_api_tokens() -> list[dict]:
+    own, args = _own()
+    with db() as c:
+        return [dict(r) for r in c.execute(f"SELECT id, name, prefix, created_at, last_used_at FROM api_tokens WHERE {own} ORDER BY id DESC",
+                                           args).fetchall()]
+
+
+def delete_api_token(token_id: int):
+    own, args = _own()
+    with db() as c:
+        c.execute(f"DELETE FROM api_tokens WHERE id = ? AND {own}", (token_id, *args))
+
+
+def user_for_api_token(token: str) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT id, user_id, last_used_at FROM api_tokens WHERE token_hash = ?", (_token_hash(token),)).fetchone()
+        if not r:
+            return None
+        # Recording every use would mean a write per request; once a minute is enough to show "last used".
+        if not r["last_used_at"] or (datetime.now(timezone.utc) - parse_iso(r["last_used_at"])).total_seconds() > 60:
+            c.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now_iso(), r["id"]))
+    return get_user(r["user_id"])
